@@ -1,0 +1,68 @@
+// Native verification suite for Log v1 round-trip replay and tamper detection (T4.1, T4.4).
+
+use core::MemBuffer
+use ingot::{play_and_log, verify_log_buffer}
+
+#[test]
+fn test_log_v1_roundtrip_100_seeded_games_and_forfeit() {
+    // 1. Verify forfeit-withholding mode round-trip
+    var f_trace = MemBuffer::empty()
+    var f_log = MemBuffer::empty()
+    let f_out = play_and_log(42, 1, 1001, 0xCAFE, mut f_trace, mut f_log)
+    assert!(f_out.finished)
+    assert!(
+        f_out.payouts[0] == 1502 && f_out.payouts[1] == 1501 && f_out.payouts[2] == 0,
+    )
+
+    var f_report = MemBuffer::empty()
+    assert!(verify_log_buffer(ref f_log, mut f_report))
+
+    // 2. Verify 100 seeded games round-trip through Log v1 serializer -> parser -> step verifier
+    var seed: u256 = 1
+    while seed <= 100 {
+        var trace = MemBuffer::empty()
+        var log = MemBuffer::empty()
+        let out = play_and_log(seed, 0, 1001, 0xCAFE, mut trace, mut log)
+        assert!(out.finished)
+
+        var rep = MemBuffer::empty()
+        assert!(verify_log_buffer(ref log, mut rep))
+        seed = seed + 1
+    }
+}
+
+#[test]
+fn test_log_v1_tamper_detection_fails() {
+    var trace = MemBuffer::empty()
+    var log = MemBuffer::empty()
+    let _ = play_and_log(7, 0, 1001, 0xCAFE, mut trace, mut log)
+
+    // Flip the last hex nibble of the first `IN` line's digest
+    let n = log.len()
+    var first_nl: usize = 0
+    var nl_count: usize = 0
+    var i: usize = 0
+    while i < n {
+        if log[i] == 10 {
+            nl_count = nl_count + 1
+            // Line 5 is `IN 1 ... -> 0x...`
+            if nl_count == 5 {
+                first_nl = i
+            }
+        }
+        i = i + 1
+    }
+    assert!(first_nl > 10)
+    let target_idx = first_nl - 1
+    let orig_byte = log[target_idx]
+    let tampered_byte: u8 = if orig_byte == 97 {
+        98
+    } else {
+        97
+    } // flip 'a' <-> 'b'
+    log[target_idx] = tampered_byte
+
+    var rep = MemBuffer::empty()
+    let ok = verify_log_buffer(ref log, mut rep)
+    assert!(!ok)
+}

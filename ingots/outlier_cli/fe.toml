@@ -1,0 +1,8 @@
+[ingot]
+name = "outlier_cli"
+version = "0.1.0"
+
+[dependencies]
+outlier_core = { path = "../outlier_core" }
+testkit = { path = "../testkit" }
+

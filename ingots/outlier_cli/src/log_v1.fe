@@ -1,0 +1,694 @@
+// Log Format v1 generator and zero-drift replay verifier (`docs/ARCHITECTURE.md §5`).
+// Re-runs every logged transition through the exact same `outlier_core::step`
+// function compiled into the EVM contract.
+
+use core::MemBuffer
+use ingot::hex::{
+    is_tok_adv,
+    is_tok_arrow,
+    is_tok_commit,
+    is_tok_game,
+    is_tok_in,
+    is_tok_join,
+    is_tok_move,
+    is_tok_poke,
+    is_tok_push,
+    is_tok_reveal,
+    is_tok_stake_kv,
+    is_tok_table,
+    next_token_end,
+    parse_u256_slice,
+    push_dec,
+    push_hex_u256,
+    skip_spaces,
+}
+use outlier_core::{
+    COMMIT_WINDOW,
+    Colour,
+    FINISH,
+    GameResult,
+    GameState,
+    Input,
+    JOIN_WINDOW,
+    MOVE_WINDOW,
+    Move,
+    PUSH,
+    Phase,
+    REVEAL_WINDOW,
+    ROUND_CAP,
+    Seat,
+    StepCtx,
+    StepOut,
+    commitment,
+    step,
+}
+use std::io::Display
+use testkit::SplitMix64
+
+fn colour_name(_ c: u8) -> String<5> {
+    if c == 0 {
+        "Red  "
+    } else if c == 1 { "Blue " } else { "Green" }
+}
+
+pub fn write_log_header(_ log_out: mut MemBuffer, _ stake: u256, _ table: u256, _ game_id: u256) {
+    "OUTLIER-LOG 1\n".fmt(mut log_out)
+    "PARAMS finish=".fmt(mut log_out)
+    push_dec(mut log_out, FINISH as u256)
+    " push=".fmt(mut log_out)
+    push_dec(mut log_out, PUSH as u256)
+    " cap=".fmt(mut log_out)
+    push_dec(mut log_out, ROUND_CAP as u256)
+    " stake=".fmt(mut log_out)
+    push_dec(mut log_out, stake)
+    " join=".fmt(mut log_out)
+    push_dec(mut log_out, JOIN_WINDOW)
+    " commit=".fmt(mut log_out)
+    push_dec(mut log_out, COMMIT_WINDOW)
+    " reveal=".fmt(mut log_out)
+    push_dec(mut log_out, REVEAL_WINDOW)
+    " move=".fmt(mut log_out)
+    push_dec(mut log_out, MOVE_WINDOW)
+    "\nTABLE ".fmt(mut log_out)
+    push_hex_u256(mut log_out, table)
+    "\nGAME ".fmt(mut log_out)
+    push_dec(mut log_out, game_id)
+    "\n".fmt(mut log_out)
+}
+
+pub fn write_log_step(
+    _ log_out: mut MemBuffer,
+    _ step_no: u256,
+    _ ts: u256,
+    _ caller: u256,
+    _ input: Input,
+    _ digest: u256,
+) {
+    "IN ".fmt(mut log_out)
+    push_dec(mut log_out, step_no)
+    " ".fmt(mut log_out)
+    push_dec(mut log_out, ts)
+    " ".fmt(mut log_out)
+    push_hex_u256(mut log_out, caller)
+    " ".fmt(mut log_out)
+    match input {
+        Input::Join => {
+            "JOIN".fmt(mut log_out)
+        },
+        Input::Commit { hash } => {
+            "COMMIT ".fmt(mut log_out)
+            push_hex_u256(mut log_out, hash)
+        },
+        Input::Reveal { colour_raw, nonce } => {
+            "REVEAL ".fmt(mut log_out)
+            push_dec(mut log_out, colour_raw as u256)
+            " ".fmt(mut log_out)
+            push_hex_u256(mut log_out, nonce)
+        },
+        Input::MoveInput { mv } => match mv {
+            Move::Advance => {
+                "MOVE ADV 0".fmt(mut log_out)
+            },
+            Move::Push { target } => {
+                "MOVE PUSH ".fmt(mut log_out)
+                push_dec(mut log_out, target.to_u256())
+            },
+        },
+        Input::Poke => {
+            "POKE".fmt(mut log_out)
+        },
+    }
+    " -> ".fmt(mut log_out)
+    push_hex_u256(mut log_out, digest)
+    "\n".fmt(mut log_out)
+}
+
+/// Chooses the winner's move using the optimal best-response heuristic:
+/// - If advancing wins immediately (`pos[winner] + 1 == FINISH`), `Advance`.
+/// - Else if any opponent is at `FINISH - 1` (threatens to win next round), `Push` that opponent!
+/// - Else `Advance`.
+pub fn smart_move(_ st: GameState, _ winner: Seat) -> Move {
+    let w_pos = st.positions.get(winner).to_u8()
+    if w_pos + 1 >= FINISH {
+        return Move::Advance
+    }
+    var opp: u8 = 0
+    while opp < 3 {
+        if opp != winner.raw {
+            let opp_seat = Seat { raw: opp }
+            if st.positions.get(opp_seat).to_u8() >= (FINISH - 1) {
+                return Move::Push { target: opp_seat }
+            }
+        }
+        opp = opp + 1
+    }
+    Move::Advance
+}
+
+/// Simulates a full 3-player game (`mode: 0 = uniform, 1 = forfeit demo, 2 = biased, 3 = exploiter`),
+/// writing human-readable round trace into `trace_out` and `OUTLIER-LOG 1` into `log_out`.
+pub fn play_and_log(
+    _ seed: u256,
+    _ mode: u8,
+    _ stake: u256,
+    _ table: u256,
+    _ trace_out: mut MemBuffer,
+    _ log_out: mut MemBuffer,
+) -> StepOut {
+    var rng = SplitMix64::new(seed)
+    let p0: u256 = 0x1001
+    let p1: u256 = 0x1002
+    let p2: u256 = 0x1003
+    let players: [u256; 3] = [p0, p1, p2]
+
+    write_log_header(mut log_out, stake, table, 1)
+
+    "=== OUTLIER GAME TRACE (seed=".fmt(mut trace_out)
+    push_dec(mut trace_out, seed)
+    ", stake=".fmt(mut trace_out)
+    push_dec(mut trace_out, stake)
+    ", mode=".fmt(mut trace_out)
+    if mode == 1 {
+        "forfeit-withholding".fmt(mut trace_out)
+    } else if mode == 2 {
+        "biased".fmt(mut trace_out)
+    } else if mode == 3 {
+        "exploiter".fmt(mut trace_out)
+    } else {
+        "uniform".fmt(mut trace_out)
+    }
+    ") ===\n".fmt(mut trace_out)
+
+    var st = GameState::new(stake)
+    var cur_digest: u256 = 0
+    var now: u256 = 1000
+    var last_out = StepOut {
+        state: st,
+        input_event: outlier_core::InputEvent::Poked { caller: 0 },
+        digest: 0,
+        finished: false,
+        payouts: [0, 0, 0],
+    }
+
+    // 1. Registration: 3 seats join
+    var j: usize = 0
+    while j < 3 {
+        now = now + 10
+        let caller = players[j]
+        match step(
+            st,
+            cur_digest,
+            Input::Join,
+            StepCtx { now, caller, table, stake_paid: stake },
+        ) {
+            Result::Ok(o) => {
+                st = o.state
+                cur_digest = o.digest
+                last_out = o
+                write_log_step(
+                    mut log_out,
+                    st.step_no,
+                    now,
+                    caller,
+                    Input::Join,
+                    cur_digest,
+                )
+            },
+            Result::Err(_) => {
+                return last_out
+            },
+        }
+        j = j + 1
+    }
+    "[Registration] Seats S0(0x1001), S1(0x1002), S2(0x1003) joined. Digest=".fmt(mut trace_out)
+    push_hex_u256(mut trace_out, cur_digest)
+    "\n".fmt(mut trace_out)
+
+    // Track S1 colour counts for adaptive exploiter (Laplace-smoothed prior 1, 1, 1)
+    var s1_counts: [u256; 3] = [1, 1, 1]
+
+    var guard: u8 = 0
+    while !last_out.finished && guard < 25 {
+        guard = guard + 1
+        let rnd = st.round
+        let gid = st.game_id
+
+        // Choose colours for S0, S1, S2
+        // - S1 is biased toward Red(0) (70% Red, 15% Blue, 15% Green) in modes 2 and 3
+        let r1_roll = rng.next_u64() % 100
+        let c1_raw: u8 = if (mode == 2 || mode == 3) {
+            if r1_roll < 70 {
+                0
+            } else if r1_roll < 85 { 1 } else { 2 }
+        } else {
+            (rng.next_u64() % 3).downcast_truncate()
+        }
+
+        let c2_raw: u8 = (rng.next_u64() % 3).downcast_truncate()
+
+        // - In mode 3 (exploiter), S0 picks a colour DIFFERENT from S1's empirical mode!
+        //   Why? Because if S1 plays Red with high probability `p > 1/3`, S0 wins whenever
+        //   (S1=Red, S2=Red, S0!=Red) OR (S1!=c0, S2=S1). Choosing the colour least played by S1
+        //   maximizes `P(S1 == S2 && S0 != S1)`!
+        let c0_raw: u8 = if mode == 3 {
+            // Find S1's most frequent colour `m`, and play `(m + 1) % 3`
+            let m: u8 = if s1_counts[0] >= s1_counts[1] && s1_counts[0] >= s1_counts[2] {
+                0
+            } else if s1_counts[1] >= s1_counts[0] && s1_counts[1] >= s1_counts[2] {
+                1
+            } else {
+                2
+            }
+            (m + 1) % 3
+        } else {
+            (rng.next_u64() % 3).downcast_truncate()
+        }
+
+        let cols_raw: [u8; 3] = [c0_raw, c1_raw, c2_raw]
+        let nonces: [u256; 3] = [
+            (rng.next_u64() + 0xA00001),
+            (rng.next_u64() + 0xB00002),
+            (rng.next_u64() + 0xC00003),
+        ]
+
+        // Commit phase
+        now = now + 5
+        var s_idx: u8 = 0
+        while s_idx < 3 {
+            let col = match Colour::from_u8(cols_raw[s_idx as usize]) {
+                Option::Some(c) => c,
+                Option::None => Colour::Red,
+            }
+            let h = commitment(
+                table,
+                game_id: gid,
+                round: rnd as u256,
+                seat: Seat { raw: s_idx },
+                colour: col,
+                nonce: nonces[s_idx as usize],
+            )
+            let inp = Input::Commit { hash: h }
+            let caller = players[s_idx as usize]
+            match step(
+                st,
+                cur_digest,
+                inp,
+                StepCtx { now, caller, table, stake_paid: 0 },
+            ) {
+                Result::Ok(o) => {
+                    st = o.state
+                    cur_digest = o.digest
+                    last_out = o
+                    write_log_step(mut log_out, st.step_no, now, caller, inp, cur_digest)
+                },
+                Result::Err(_) => {
+                    return last_out
+                },
+            }
+            s_idx = s_idx + 1
+        }
+
+        // Reveal phase (in mode == 1 on round 2, S2 withholds reveal after seeing S0 & S1!)
+        let withhold_s2 = (mode == 1) && (rnd == 2)
+        let rev_count: u8 = if withhold_s2 { 2 } else { 3 }
+        now = now + 5
+        var r_idx: u8 = 0
+        while r_idx < rev_count {
+            let inp = Input::Reveal {
+                colour_raw: cols_raw[r_idx as usize],
+                nonce: nonces[r_idx as usize],
+            }
+            let caller = players[r_idx as usize]
+            match step(
+                st,
+                cur_digest,
+                inp,
+                StepCtx { now, caller, table, stake_paid: 0 },
+            ) {
+                Result::Ok(o) => {
+                    st = o.state
+                    cur_digest = o.digest
+                    last_out = o
+                    write_log_step(mut log_out, st.step_no, now, caller, inp, cur_digest)
+                },
+                Result::Err(_) => {
+                    return last_out
+                },
+            }
+            r_idx = r_idx + 1
+        }
+
+        if withhold_s2 {
+            "[Round ".fmt(mut trace_out)
+            push_dec(mut trace_out, rnd as u256)
+            "] S0 & S1 revealed; S2 withholds reveal past deadline -> POKE triggers Forfeited(mask=4)!\n"
+                .fmt(mut trace_out)
+            now = now + REVEAL_WINDOW + 5
+            match step(
+                st,
+                cur_digest,
+                Input::Poke,
+                StepCtx { now, caller: p0, table, stake_paid: 0 },
+            ) {
+                Result::Ok(o) => {
+                    st = o.state
+                    cur_digest = o.digest
+                    last_out = o
+                    write_log_step(mut log_out, st.step_no, now, p0, Input::Poke, cur_digest)
+                },
+                Result::Err(_) => {
+                    return last_out
+                },
+            }
+        } else {
+            // Update S1 frequency count after reveal
+            s1_counts[c1_raw as usize] = s1_counts[c1_raw as usize] + 1
+
+            "[Round ".fmt(mut trace_out)
+            push_dec(mut trace_out, rnd as u256)
+            "] Reveals: S0=".fmt(mut trace_out)
+            colour_name(c0_raw).fmt(mut trace_out)
+            " S1=".fmt(mut trace_out)
+            colour_name(c1_raw).fmt(mut trace_out)
+            " S2=".fmt(mut trace_out)
+            colour_name(c2_raw).fmt(mut trace_out)
+
+            match st.phase {
+                Phase::WinnerMove { winner, .. } => {
+                    " -> Winner=S".fmt(mut trace_out)
+                    push_dec(mut trace_out, winner.to_u256())
+                    let mv = smart_move(st, winner)
+                    match mv {
+                        Move::Advance => " Move=ADV".fmt(mut trace_out),
+                        Move::Push { target } => {
+                            " Move=PUSH(S".fmt(mut trace_out)
+                            push_dec(mut trace_out, target.to_u256())
+                            ")".fmt(mut trace_out)
+                        },
+                    }
+                    now = now + 5
+                    let inp = Input::MoveInput { mv }
+                    let caller = players[winner.index()]
+                    match step(
+                        st,
+                        cur_digest,
+                        inp,
+                        StepCtx { now, caller, table, stake_paid: 0 },
+                    ) {
+                        Result::Ok(o) => {
+                            st = o.state
+                            cur_digest = o.digest
+                            last_out = o
+                            write_log_step(mut log_out, st.step_no, now, caller, inp, cur_digest)
+                        },
+                        Result::Err(_) => {
+                            return last_out
+                        },
+                    }
+                },
+                _ => {
+                    " -> NoWinner".fmt(mut trace_out)
+                },
+            }
+
+            " | Track=(".fmt(mut trace_out)
+            push_dec(mut trace_out, st.positions.p0.to_u256())
+            ",".fmt(mut trace_out)
+            push_dec(mut trace_out, st.positions.p1.to_u256())
+            ",".fmt(mut trace_out)
+            push_dec(mut trace_out, st.positions.p2.to_u256())
+            ")\n".fmt(mut trace_out)
+        }
+    }
+
+    "[Finished] steps=".fmt(mut trace_out)
+    push_dec(mut trace_out, st.step_no)
+    " payouts=(".fmt(mut trace_out)
+    push_dec(mut trace_out, last_out.payouts[0])
+    ", ".fmt(mut trace_out)
+    push_dec(mut trace_out, last_out.payouts[1])
+    ", ".fmt(mut trace_out)
+    push_dec(mut trace_out, last_out.payouts[2])
+    ") final_digest=".fmt(mut trace_out)
+    push_hex_u256(mut trace_out, cur_digest)
+    "\n".fmt(mut trace_out)
+
+    last_out
+}
+
+fn report_divergence(
+    _ report: mut MemBuffer,
+    _ step_k: u256,
+    _ expected: u256,
+    _ actual: u256,
+) -> bool {
+    "DIVERGENCE at step ".fmt(mut report)
+    push_dec(mut report, step_k)
+    ": expected ".fmt(mut report)
+    push_hex_u256(mut report, expected)
+    ", got ".fmt(mut report)
+    push_hex_u256(mut report, actual)
+    "\n".fmt(mut report)
+    false
+}
+
+/// Parses an `OUTLIER-LOG 1` buffer and re-verifies every transition through `outlier_core::step`.
+/// Appends `VERIFIED <n> transitions, final digest 0x...` or `DIVERGENCE at step <k>: ...` to `report`.
+pub fn verify_log_buffer(_ raw: ref MemBuffer, _ report: mut MemBuffer) -> bool {
+    let total_len = raw.len()
+    var stake: u256 = 1001
+    var table: u256 = 0
+    var state = GameState::new(stake)
+    var cur_digest: u256 = 0
+    var transitions_count: u256 = 0
+    var state_initialized = false
+
+    var line_start: usize = 0
+    while line_start < total_len {
+        var line_end = line_start
+        while line_end < total_len && raw[line_end] != 10 {
+            line_end = line_end + 1
+        }
+
+        let t0_s = skip_spaces(raw, line_start, line_end)
+        let t0_e = next_token_end(raw, t0_s, line_end)
+
+        if t0_s < t0_e {
+            // Check `PARAMS ... stake=<N>`
+            if (t0_e - t0_s) == 6
+                && raw[t0_s] == 80
+                && raw[t0_s + 1] == 65
+                && raw[t0_s + 2] == 82
+                && raw[t0_s + 3] == 65
+                && raw[t0_s + 4] == 77
+                && raw[t0_s + 5] == 83 {
+                var p = t0_e
+                while p < line_end {
+                    let ks = skip_spaces(raw, p, line_end)
+                    let ke = next_token_end(raw, ks, line_end)
+                    if ks < ke {
+                        match is_tok_stake_kv(raw, ks, ke) {
+                            Option::Some(st_val) => {
+                                stake = st_val
+                                state = GameState::new(stake)
+                                state_initialized = true
+                            },
+                            Option::None => {},
+                        }
+                    }
+                    p = ke
+                }
+            } else if is_tok_table(raw, t0_s, t0_e) {
+                let ts = skip_spaces(raw, t0_e, line_end)
+                let te = next_token_end(raw, ts, line_end)
+                match parse_u256_slice(raw, ts, te) {
+                    Option::Some(tb) => {
+                        table = tb
+                    },
+                    Option::None => {
+                        return report_divergence(mut report, 0, 1, 0)
+                    },
+                }
+            } else if is_tok_game(raw, t0_s, t0_e) {
+                let gs = skip_spaces(raw, t0_e, line_end)
+                let ge = next_token_end(raw, gs, line_end)
+                match parse_u256_slice(raw, gs, ge) {
+                    Option::Some(gid) => {
+                        if !state_initialized {
+                            state = GameState::new(stake)
+                            state_initialized = true
+                        }
+                        if gid >= 1 {
+                            state.game_id = gid - 1
+                        }
+                    },
+                    Option::None => {
+                        return report_divergence(mut report, 0, 1, 0)
+                    },
+                }
+            } else if is_tok_in(raw, t0_s, t0_e) {
+                if !state_initialized {
+                    state = GameState::new(stake)
+                    state_initialized = true
+                }
+
+                // Format: IN <step_no> <ts> <caller> <ACTION...> -> <expected_digest>
+                let s1 = skip_spaces(raw, t0_e, line_end)
+                let e1 = next_token_end(raw, s1, line_end)
+                let step_no = match parse_u256_slice(raw, s1, e1) {
+                    Option::Some(v) => v,
+                    Option::None => {
+                        return report_divergence(mut report, transitions_count + 1, 1, 0)
+                    },
+                }
+
+                let s2 = skip_spaces(raw, e1, line_end)
+                let e2 = next_token_end(raw, s2, line_end)
+                let ts = match parse_u256_slice(raw, s2, e2) {
+                    Option::Some(v) => v,
+                    Option::None => {
+                        return report_divergence(mut report, step_no, 1, 0)
+                    },
+                }
+
+                let s3 = skip_spaces(raw, e2, line_end)
+                let e3 = next_token_end(raw, s3, line_end)
+                let caller = match parse_u256_slice(raw, s3, e3) {
+                    Option::Some(v) => v,
+                    Option::None => {
+                        return report_divergence(mut report, step_no, 1, 0)
+                    },
+                }
+
+                let s4 = skip_spaces(raw, e3, line_end)
+                let e4 = next_token_end(raw, s4, line_end)
+
+                var after_action_pos = e4
+                var stake_paid: u256 = 0
+                let parsed_input: Option<Input> = if is_tok_join(raw, s4, e4) {
+                    stake_paid = stake
+                    Option::Some(Input::Join)
+                } else if is_tok_poke(raw, s4, e4) {
+                    Option::Some(Input::Poke)
+                } else if is_tok_commit(raw, s4, e4) {
+                    let sh = skip_spaces(raw, e4, line_end)
+                    let eh = next_token_end(raw, sh, line_end)
+                    after_action_pos = eh
+                    match parse_u256_slice(raw, sh, eh) {
+                        Option::Some(h) => Option::Some(Input::Commit { hash: h }),
+                        Option::None => Option::None,
+                    }
+                } else if is_tok_reveal(raw, s4, e4) {
+                    let sc = skip_spaces(raw, e4, line_end)
+                    let ec = next_token_end(raw, sc, line_end)
+                    let sn = skip_spaces(raw, ec, line_end)
+                    let en = next_token_end(raw, sn, line_end)
+                    after_action_pos = en
+                    match (parse_u256_slice(raw, sc, ec), parse_u256_slice(raw, sn, en)) {
+                        (Option::Some(c_u256), Option::Some(nonce_val)) => {
+                            if c_u256 <= 255 {
+                                Option::Some(
+                                    Input::Reveal {
+                                        colour_raw: c_u256.downcast_truncate(),
+                                        nonce: nonce_val,
+                                    },
+                                )
+                            } else {
+                                Option::None
+                            }
+                        },
+                        _ => Option::None,
+                    }
+                } else if is_tok_move(raw, s4, e4) {
+                    let sk = skip_spaces(raw, e4, line_end)
+                    let ek = next_token_end(raw, sk, line_end)
+                    let st_pos = skip_spaces(raw, ek, line_end)
+                    let et_pos = next_token_end(raw, st_pos, line_end)
+                    after_action_pos = et_pos
+                    if is_tok_adv(raw, sk, ek) {
+                        Option::Some(Input::MoveInput { mv: Move::Advance })
+                    } else if is_tok_push(raw, sk, ek) {
+                        match parse_u256_slice(raw, st_pos, et_pos) {
+                            Option::Some(t_u256) => {
+                                if t_u256 <= 2 {
+                                    Option::Some(
+                                        Input::MoveInput {
+                                            mv: Move::Push {
+                                                target: Seat { raw: t_u256.downcast_truncate() },
+                                            },
+                                        },
+                                    )
+                                } else {
+                                    Option::None
+                                }
+                            },
+                            Option::None => Option::None,
+                        }
+                    } else {
+                        Option::None
+                    }
+                } else {
+                    Option::None
+                }
+
+                // Parse `-> <expected_digest>`
+                let sa = skip_spaces(raw, after_action_pos, line_end)
+                let ea = next_token_end(raw, sa, line_end)
+                let sd = skip_spaces(raw, ea, line_end)
+                let ed = next_token_end(raw, sd, line_end)
+                let expected_digest = match parse_u256_slice(raw, sd, ed) {
+                    Option::Some(d) => d,
+                    Option::None => 0,
+                }
+
+                if !is_tok_arrow(raw, sa, ea) || expected_digest == 0 {
+                    return report_divergence(mut report, step_no, expected_digest, 0)
+                }
+
+                let inp = match parsed_input {
+                    Option::Some(i) => i,
+                    Option::None => {
+                        return report_divergence(mut report, step_no, expected_digest, 0)
+                    },
+                }
+
+                match step(
+                    state,
+                    cur_digest,
+                    inp,
+                    StepCtx { now: ts, caller, table, stake_paid },
+                ) {
+                    Result::Err(_) => {
+                        return report_divergence(mut report, step_no, expected_digest, 0)
+                    },
+                    Result::Ok(out) => {
+                        if out.state.step_no != step_no || out.digest != expected_digest {
+                            return report_divergence(
+                                mut report,
+                                step_no,
+                                expected_digest,
+                                out.digest,
+                            )
+                        }
+                        state = out.state
+                        cur_digest = out.digest
+                        transitions_count = transitions_count + 1
+                    },
+                }
+            }
+        }
+
+        line_start = line_end + 1
+    }
+
+    if transitions_count == 0 {
+        return report_divergence(mut report, 0, 1, 0)
+    }
+
+    "VERIFIED ".fmt(mut report)
+    push_dec(mut report, transitions_count)
+    " transitions, final digest ".fmt(mut report)
+    push_hex_u256(mut report, cur_digest)
+    "\n".fmt(mut report)
+    true
+}

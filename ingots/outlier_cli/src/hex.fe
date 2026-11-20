@@ -1,0 +1,208 @@
+// Pure hex and decimal formatting & token parsing helpers for Log v1 (`ingots/outlier_cli`).
+
+use core::MemBuffer
+use std::io::Display
+
+fn nibble_to_hex_byte(_ nib: u8) -> u8 {
+    if nib < 10 {
+        48 + nib // '0'..'9'
+    } else {
+        87 + nib // 'a'..'f' (97 - 10)
+    }
+}
+
+fn hex_byte_to_nibble(_ b: u8) -> Option<u8> {
+    if b >= 48 && b <= 57 {
+        Option::Some(b - 48)
+    } else if b >= 97 && b <= 102 {
+        Option::Some(b - 87)
+    } else if b >= 65 && b <= 70 {
+        Option::Some(b - 55)
+    } else {
+        Option::None
+    }
+}
+
+/// Appends `0x` followed by 64 lowercase hex digits (full 32-byte word).
+pub fn push_hex_u256(_ out: mut MemBuffer, _ val: u256) {
+    "0x".fmt(mut out)
+    var i: u256 = 64
+    while i > 0 {
+        i = i - 1
+        let shift = i * 4
+        let nib: u8 = ((val >> shift) & 0xF).downcast_truncate()
+        out.push(nibble_to_hex_byte(nib))
+    }
+}
+
+/// Appends decimal representation of `val` using `Display`.
+pub fn push_dec(_ out: mut MemBuffer, _ val: u256) {
+    val.fmt(mut out)
+}
+
+/// Appends a fixed-point percentage `scaled / 10_000` with 2 decimal places (where `1_000_000 = 100.00%`).
+pub fn push_pct(_ out: mut MemBuffer, _ scaled: u256) {
+    let whole = scaled / 10000
+    let frac = (scaled % 10000) / 100
+    whole.fmt(mut out)
+    ".".fmt(mut out)
+    if frac < 10 {
+        "0".fmt(mut out)
+    }
+    frac.fmt(mut out)
+    "%".fmt(mut out)
+}
+
+pub fn is_space(_ b: u8) -> bool {
+    b == 32 || b == 9 || b == 13
+}
+
+/// Advances `pos` past horizontal whitespace (`' '`, `'\t'`, `'\r'`) within `[pos, line_end)`.
+pub fn skip_spaces(_ buf: ref MemBuffer, _ pos: usize, _ line_end: usize) -> usize {
+    var p = pos
+    while p < line_end && is_space(buf[p]) {
+        p = p + 1
+    }
+    p
+}
+
+/// Finds the end of the token starting at `pos` within `[pos, line_end)`.
+pub fn next_token_end(_ buf: ref MemBuffer, _ pos: usize, _ line_end: usize) -> usize {
+    var p = pos
+    while p < line_end && !is_space(buf[p]) {
+        p = p + 1
+    }
+    p
+}
+
+/// Parses a `u256` from `buf[start..end]` in either `0x...` hex or decimal format.
+pub fn parse_u256_slice(_ buf: ref MemBuffer, _ start: usize, _ end: usize) -> Option<u256> {
+    if start >= end {
+        return Option::None
+    }
+    if (end - start) > 2 && buf[start] == 48 && (buf[start + 1] == 120 || buf[start + 1] == 88) {
+        var acc: u256 = 0
+        var i: usize = start + 2
+        while i < end {
+            match hex_byte_to_nibble(buf[i]) {
+                Option::None => {
+                    return Option::None
+                },
+                Option::Some(nib) => {
+                    acc = (acc << 4) | (nib as u256)
+                },
+            }
+            i = i + 1
+        }
+        return Option::Some(acc)
+    }
+
+    var acc: u256 = 0
+    var i: usize = start
+    while i < end {
+        let b = buf[i]
+        if b < 48 || b > 57 {
+            return Option::None
+        }
+        acc = (acc * 10) + ((b - 48) as u256)
+        i = i + 1
+    }
+    Option::Some(acc)
+}
+
+// Token match helpers for `OUTLIER-LOG 1` keywords:
+pub fn is_tok_in(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 2 && buf[s] == 73 && buf[s + 1] == 78 // "IN"
+}
+
+pub fn is_tok_arrow(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 2 && buf[s] == 45 && buf[s + 1] == 62 // "->"
+}
+
+pub fn is_tok_join(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 4
+        && buf[s] == 74
+        && buf[s + 1] == 79
+        && buf[s + 2] == 73
+        && buf[s + 3] == 78 // "JOIN"
+}
+
+pub fn is_tok_poke(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 4
+        && buf[s] == 80
+        && buf[s + 1] == 79
+        && buf[s + 2] == 75
+        && buf[s + 3] == 69 // "POKE"
+}
+
+pub fn is_tok_move(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 4
+        && buf[s] == 77
+        && buf[s + 1] == 79
+        && buf[s + 2] == 86
+        && buf[s + 3] == 69 // "MOVE"
+}
+
+pub fn is_tok_adv(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 3 && buf[s] == 65 && buf[s + 1] == 68 && buf[s + 2] == 86 // "ADV"
+}
+
+pub fn is_tok_push(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 4
+        && buf[s] == 80
+        && buf[s + 1] == 85
+        && buf[s + 2] == 83
+        && buf[s + 3] == 72 // "PUSH"
+}
+
+pub fn is_tok_commit(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 6
+        && buf[s] == 67
+        && buf[s + 1] == 79
+        && buf[s + 2] == 77
+        && buf[s + 3] == 77
+        && buf[s + 4] == 73
+        && buf[s + 5] == 84 // "COMMIT"
+}
+
+pub fn is_tok_reveal(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 6
+        && buf[s] == 82
+        && buf[s + 1] == 69
+        && buf[s + 2] == 86
+        && buf[s + 3] == 69
+        && buf[s + 4] == 65
+        && buf[s + 5] == 76 // "REVEAL"
+}
+
+pub fn is_tok_table(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 5
+        && buf[s] == 84
+        && buf[s + 1] == 65
+        && buf[s + 2] == 66
+        && buf[s + 3] == 76
+        && buf[s + 4] == 69 // "TABLE"
+}
+
+pub fn is_tok_game(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> bool {
+    (e - s) == 4
+        && buf[s] == 71
+        && buf[s + 1] == 65
+        && buf[s + 2] == 77
+        && buf[s + 3] == 69 // "GAME"
+}
+
+pub fn is_tok_stake_kv(_ buf: ref MemBuffer, _ s: usize, _ e: usize) -> Option<u256> {
+    // Matches "stake=<u256>"
+    if (e - s) > 6
+        && buf[s] == 115
+        && buf[s + 1] == 116
+        && buf[s + 2] == 97
+        && buf[s + 3] == 107
+        && buf[s + 4] == 101
+        && buf[s + 5] == 61 {
+        parse_u256_slice(buf, s + 6, e)
+    } else {
+        Option::None
+    }
+}
