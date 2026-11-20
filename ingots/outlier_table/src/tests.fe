@@ -685,4 +685,250 @@ fn test_contract_errors_full_game_withdraw_and_parity() uses (evm: mut Evm) {
     assert!(
         !err_double_w.success() && is_error<NothingToWithdraw>(err_double_w.returndata()),
     )
+
+    // 8. Verify multi-game restart from Finished (Game #2 starts with gameId == 2, stepNo == 1)
+    evm.call(
+        addr: p1,
+        gas: 1000000,
+        value: stake,
+        message: ProxyMsg::Join { table },
+    )
+    let gid2: u256 = evm
+        .call(
+            addr: table,
+            gas: 200000,
+            value: Wei::zero(),
+            message: TableMsg::GetGameId {},
+        )
+    assert!(gid2 == 2 && get_step_no(table) == 1)
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn test_security_copy_commitment_round_replay_and_zero_stake()
+uses (evm: mut Evm)
+{
+    // Deploy zero-stake table (STAKE = 0, money-free Tier A)
+    let table = evm.create2<OutlierTable>(value: Wei::zero(), args: (Wei::zero(),), salt: 10)
+    let p0 = evm.create2<PlayerProxy>(value: Wei::zero(), args: (), salt: 11)
+    let p1 = evm.create2<PlayerProxy>(value: Wei::zero(), args: (), salt: 12)
+    let p2 = evm.create2<PlayerProxy>(value: Wei::zero(), args: (), salt: 13)
+
+    evm.call(
+        addr: p0,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Join { table },
+    )
+    evm.call(
+        addr: p1,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Join { table },
+    )
+    evm.call(
+        addr: p2,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Join { table },
+    )
+
+    // Security check A: Copy-commitment attack (S1 submits S0's exact commitment hash `h_r1_s0`)
+    let h_r1_s0 = commitment(
+        table: table.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s0(),
+        colour: Colour::Red,
+        nonce: 777,
+    )
+    let h_r1_s1_real = commitment(
+        table: table.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s1(),
+        colour: Colour::Red,
+        nonce: 777,
+    )
+    let h_r1_s2 = commitment(
+        table: table.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s2(),
+        colour: Colour::Red,
+        nonce: 888,
+    )
+    assert!(
+        h_r1_s0 != h_r1_s1_real,
+    ) // Seat binding makes identical (colour, nonce) hash differently
+
+    evm.call(
+        addr: p0,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table, hash: h_r1_s0 },
+    )
+    evm.call(
+        addr: p1,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table, hash: h_r1_s0 },
+    )
+    evm.call(
+        addr: p2,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table, hash: h_r1_s2 },
+    )
+
+    // S0 reveals (Red, 777) -> succeeds
+    evm.call(
+        addr: p0,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Reveal { table, colour_raw: 0, nonce: 777 },
+    )
+    // S1 attempts to reveal with S0's (Red, 777) -> MUST revert with BadReveal!
+    let d_before = get_digest(table)
+    let copy_attack = evm
+        .try_call(
+            addr: p1,
+            gas: 800000,
+            value: Wei::zero(),
+            message: ProxyMsg::Reveal { table, colour_raw: 0, nonce: 777 },
+        )
+    assert!(
+        !copy_attack.success() && is_error<BadReveal>(copy_attack.returndata()),
+    )
+    assert!(get_digest(table) == d_before)
+
+    // Security check B: Round-replay attack on fresh table (S0 reuses Round 1 commitment in Round 2)
+    let table2 = evm.create2<OutlierTable>(value: Wei::zero(), args: (Wei::zero(),), salt: 20)
+    evm.call(
+        addr: p0,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Join { table: table2 },
+    )
+    evm.call(
+        addr: p1,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Join { table: table2 },
+    )
+    evm.call(
+        addr: p2,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Join { table: table2 },
+    )
+
+    let g2_h0 = commitment(
+        table: table2.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s0(),
+        colour: Colour::Red,
+        nonce: 555,
+    )
+    let g2_h1 = commitment(
+        table: table2.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s1(),
+        colour: Colour::Red,
+        nonce: 555,
+    )
+    let g2_h2 = commitment(
+        table: table2.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s2(),
+        colour: Colour::Red,
+        nonce: 555,
+    )
+    evm.call(
+        addr: p0,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table: table2, hash: g2_h0 },
+    )
+    evm.call(
+        addr: p1,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table: table2, hash: g2_h1 },
+    )
+    evm.call(
+        addr: p2,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table: table2, hash: g2_h2 },
+    )
+    // All 3 reveal Red -> NoWinner -> advances to Round 2 Commit!
+    evm.call(
+        addr: p0,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Reveal { table: table2, colour_raw: 0, nonce: 555 },
+    )
+    evm.call(
+        addr: p1,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Reveal { table: table2, colour_raw: 0, nonce: 555 },
+    )
+    evm.call(
+        addr: p2,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Reveal { table: table2, colour_raw: 0, nonce: 555 },
+    )
+
+    // In Round 2, S0 replays their Round 1 hash `g2_h0`, while S1 and S2 commit valid Round 2 hashes
+    let g2_r2_h1 = commitment(
+        table: table2.word(),
+        game_id: 1,
+        round: 2,
+        seat: Seat::s1(),
+        colour: Colour::Blue,
+        nonce: 666,
+    )
+    let g2_r2_h2 = commitment(
+        table: table2.word(),
+        game_id: 1,
+        round: 2,
+        seat: Seat::s2(),
+        colour: Colour::Green,
+        nonce: 666,
+    )
+    evm.call(
+        addr: p0,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table: table2, hash: g2_h0 },
+    )
+    evm.call(
+        addr: p1,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table: table2, hash: g2_r2_h1 },
+    )
+    evm.call(
+        addr: p2,
+        gas: 800000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table: table2, hash: g2_r2_h2 },
+    )
+
+    // S0 tries to reveal Round 1's (Red, 555) in Round 2 -> MUST revert with BadReveal because `round` is bound!
+    let replay_attack = evm
+        .try_call(
+            addr: p0,
+            gas: 800000,
+            value: Wei::zero(),
+            message: ProxyMsg::Reveal { table: table2, colour_raw: 0, nonce: 555 },
+        )
+    assert!(
+        !replay_attack.success() && is_error<BadReveal>(replay_attack.returndata()),
+    )
 }
