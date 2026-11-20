@@ -1,0 +1,22 @@
+// Compile-fail fixture 2 (C-06): A `match` on `Phase` that omits `Phase::WinnerMove`.
+// Expected error: `error[8-0034]: non-exhaustive patterns`
+
+pub enum Phase {
+    Idle,
+    Registration { pub deadline: u256 },
+    Commit { pub round: u8, pub deadline: u256 },
+    Reveal { pub round: u8, pub deadline: u256 },
+    WinnerMove { pub round: u8, pub winner: u8, pub deadline: u256 },
+    Finished { pub code: u8 },
+}
+
+pub fn unhandled_phase(_ p: Phase) -> u8 {
+    match p {
+        Phase::Idle => 0,
+        Phase::Registration { .. } => 1,
+        Phase::Commit { .. } => 2,
+        Phase::Reveal { .. } => 3,
+        Phase::Finished { .. } => 5,
+    }
+}
+

@@ -1,0 +1,19 @@
+// Compile-fail fixture 4 (C-03 / Property P5): Attempting to pass board `Positions`
+// into `settle_forfeit(mask, stake)` to make forfeit payout position-dependent.
+// Expected error: `error[8-0023]` or `error[8-0000]` (rejected by signature).
+
+pub struct Positions {
+    pub p0: u8,
+    pub p1: u8,
+    pub p2: u8,
+}
+
+pub fn settle_forfeit(_ mask: u8, _ stake: u256) -> [u256; 3] {
+    [stake, stake, stake]
+}
+
+pub fn attempt_position_dependent_forfeit() -> [u256; 3] {
+    let pos = Positions { p0: 3, p1: 1, p2: 0 }
+    settle_forfeit(1, 1001, pos)
+}
+

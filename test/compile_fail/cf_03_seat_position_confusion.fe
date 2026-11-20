@@ -1,0 +1,20 @@
+// Compile-fail fixture 3 (C-07): Passing a `Position` newtype where a `Seat` newtype is expected.
+// Expected error: `error[8-0000]: type mismatch`
+
+pub struct Seat {
+    pub raw: u8,
+}
+
+pub struct Position {
+    pub raw: u8,
+}
+
+fn require_seat(_ s: Seat) -> u8 {
+    s.raw
+}
+
+pub fn confuse_position_for_seat() -> u8 {
+    let pos = Position { raw: 2 }
+    require_seat(pos)
+}
+

@@ -1,0 +1,14 @@
+// Compile-fail fixture 1 (C-05): A pure protocol function (no `uses` clause)
+// attempting to call a function that requires an EVM capability (`Ctx`).
+// Expected error: `error[8-0036]: missing effect Ctx`
+
+use std::evm::effects::Ctx
+
+fn read_ambient_clock() -> u256 uses (ctx: Ctx) {
+    ctx.timestamp().as_seconds()
+}
+
+pub fn illegal_pure_step() -> u256 {
+    read_ambient_clock()
+}
+
