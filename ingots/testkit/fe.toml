@@ -1,0 +1,7 @@
+[ingot]
+name = "testkit"
+version = "0.1.0"
+
+[dependencies]
+outlier_core = { path = "../outlier_core" }
+

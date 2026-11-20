@@ -1,0 +1,327 @@
+// Deterministic PRNG (`SplitMix64`) and scripted multi-game runner for dual-backend parity (T3.4, T3.5).
+// Pure Fe (zero `uses` clauses) — runs identically on EVM (`sonatina`) and `native` backends.
+
+use core::intrinsic::__keccak_words
+use outlier_core::{
+    COMMIT_WINDOW,
+    Colour,
+    GameState,
+    Input,
+    JOIN_WINDOW,
+    MOVE_WINDOW,
+    Move,
+    Phase,
+    REVEAL_WINDOW,
+    Seat,
+    StepCtx,
+    StepOut,
+    commitment,
+    step,
+}
+
+const MASK64: u256 = 0xFFFFFFFFFFFFFFFF
+
+pub struct SplitMix64 { pub state: u256 }
+
+impl Copy for SplitMix64 {}
+
+impl SplitMix64 {
+    pub fn new(_ seed: u256) -> SplitMix64 {
+        SplitMix64 { state: seed & MASK64 }
+    }
+
+    pub fn next_u64(mut self) -> u256 {
+        let z0 = (self.state + 0x9e3779b97f4a7c15) & MASK64
+        self.state = z0
+        let z1 = ((z0 ^ (z0 >> 30)) * 0xbf58476d1ce4e5b9) & MASK64
+        let z2 = ((z1 ^ (z1 >> 27)) * 0x94d049bb133111eb) & MASK64
+        (z2 ^ (z2 >> 31)) & MASK64
+    }
+}
+
+/// Runs a deterministic seeded game (including valid moves, NoWinner rounds, Push/Advance choices,
+/// and periodic timeout/forfeit branches depending on seed) through `outlier_core::step` and returns
+/// the final `StepOut`.
+pub fn run_seeded_game(_ seed: u256, _ stake: u256, _ table: u256) -> StepOut {
+    var rng = SplitMix64::new(seed)
+    let p0: u256 = 0x1001
+    let p1: u256 = 0x1002
+    let p2: u256 = 0x1003
+    let players: [u256; 3] = [p0, p1, p2]
+
+    var st = GameState::new(stake)
+    var cur_digest: u256 = 0
+    var now: u256 = 1000 + (seed * 17)
+    var last_out = StepOut {
+        state: st,
+        input_event: outlier_core::InputEvent::Poked { caller: 0 },
+        digest: 0,
+        finished: false,
+        payouts: [0, 0, 0],
+    }
+
+    // 1. Player 0 joins
+    match step(
+        st,
+        cur_digest,
+        Input::Join,
+        StepCtx { now, caller: p0, table, stake_paid: stake },
+    ) {
+        Result::Ok(o) => {
+            st = o.state
+            cur_digest = o.digest
+            last_out = o
+        },
+        Result::Err(_) => {
+            return last_out
+        },
+    }
+
+    // Every 19th seed: exercise registration cancel timeout
+    if (seed % 19) == 7 {
+        now = now + JOIN_WINDOW + 5
+        match step(
+            st,
+            cur_digest,
+            Input::Poke,
+            StepCtx { now, caller: 0x9999, table, stake_paid: 0 },
+        ) {
+            Result::Ok(o) => {
+                return o
+            },
+            Result::Err(_) => {
+                return last_out
+            },
+        }
+    }
+
+    // Players 1 and 2 join
+    now = now + 10
+    match step(
+        st,
+        cur_digest,
+        Input::Join,
+        StepCtx { now, caller: p1, table, stake_paid: stake },
+    ) {
+        Result::Ok(o) => {
+            st = o.state
+            cur_digest = o.digest
+            last_out = o
+        },
+        Result::Err(_) => {
+            return last_out
+        },
+    }
+    now = now + 10
+    match step(
+        st,
+        cur_digest,
+        Input::Join,
+        StepCtx { now, caller: p2, table, stake_paid: stake },
+    ) {
+        Result::Ok(o) => {
+            st = o.state
+            cur_digest = o.digest
+            last_out = o
+        },
+        Result::Err(_) => {
+            return last_out
+        },
+    }
+
+    // Play rounds until Finished
+    var guard: u8 = 0
+    while !last_out.finished && guard < 25 {
+        guard = guard + 1
+        let rnd = st.round as u256
+        let gid = st.game_id
+
+        let c0_raw: u8 = (rng.next_u64() % 3).downcast_truncate()
+        let c1_raw: u8 = (rng.next_u64() % 3).downcast_truncate()
+        let c2_raw: u8 = (rng.next_u64() % 3).downcast_truncate()
+        let cols_raw: [u8; 3] = [c0_raw, c1_raw, c2_raw]
+
+        let n0 = rng.next_u64() + 100
+        let n1 = rng.next_u64() + 200
+        let n2 = rng.next_u64() + 300
+        let nonces: [u256; 3] = [n0, n1, n2]
+
+        // Every 17th seed on round 2: exercise Commit timeout forfeit (only S0 and S1 commit, S2 stalls)
+        let stall_commit = ((seed % 17) == 5) && (st.round == 2)
+        var s_idx: u8 = 0
+        let commit_limit: u8 = if stall_commit { 2 } else { 3 }
+        now = now + 5
+        while s_idx < commit_limit {
+            let col = match Colour::from_u8(cols_raw[s_idx as usize]) {
+                Option::Some(c) => c,
+                Option::None => Colour::Red,
+            }
+            let h = commitment(
+                table,
+                game_id: gid,
+                round: rnd,
+                seat: Seat { raw: s_idx },
+                colour: col,
+                nonce: nonces[s_idx as usize],
+            )
+            match step(
+                st,
+                cur_digest,
+                Input::Commit { hash: h },
+                StepCtx { now, caller: players[s_idx as usize], table, stake_paid: 0 },
+            ) {
+                Result::Ok(o) => {
+                    st = o.state
+                    cur_digest = o.digest
+                    last_out = o
+                },
+                Result::Err(_) => {
+                    return last_out
+                },
+            }
+            s_idx = s_idx + 1
+        }
+
+        if stall_commit {
+            now = now + COMMIT_WINDOW + 10
+            match step(
+                st,
+                cur_digest,
+                Input::Poke,
+                StepCtx { now, caller: p0, table, stake_paid: 0 },
+            ) {
+                Result::Ok(o) => {
+                    return o
+                },
+                Result::Err(_) => {
+                    return last_out
+                },
+            }
+        }
+
+        // Every 13th seed on round 1: exercise Reveal timeout forfeit (S0 reveals, S1 & S2 stall)
+        let stall_reveal = ((seed % 13) == 3) && (st.round == 1)
+        let reveal_limit: u8 = if stall_reveal { 1 } else { 3 }
+        var r_idx: u8 = 0
+        now = now + 5
+        while r_idx < reveal_limit {
+            match step(
+                st,
+                cur_digest,
+                Input::Reveal {
+                    colour_raw: cols_raw[r_idx as usize],
+                    nonce: nonces[r_idx as usize],
+                },
+                StepCtx { now, caller: players[r_idx as usize], table, stake_paid: 0 },
+            ) {
+                Result::Ok(o) => {
+                    st = o.state
+                    cur_digest = o.digest
+                    last_out = o
+                },
+                Result::Err(_) => {
+                    return last_out
+                },
+            }
+            r_idx = r_idx + 1
+        }
+
+        if stall_reveal {
+            now = now + REVEAL_WINDOW + 10
+            match step(
+                st,
+                cur_digest,
+                Input::Poke,
+                StepCtx { now, caller: p0, table, stake_paid: 0 },
+            ) {
+                Result::Ok(o) => {
+                    return o
+                },
+                Result::Err(_) => {
+                    return last_out
+                },
+            }
+        }
+
+        // If in WinnerMove phase, either make a move or timeout-default
+        if !last_out.finished {
+            match st.phase {
+                Phase::WinnerMove { winner, .. } => {
+                    let choice = rng.next_u64() % 5
+                    if choice == 4 {
+                        // Exercise WinnerMove timeout -> default Advance
+                        now = now + MOVE_WINDOW + 5
+                        match step(
+                            st,
+                            cur_digest,
+                            Input::Poke,
+                            StepCtx { now, caller: p0, table, stake_paid: 0 },
+                        ) {
+                            Result::Ok(o) => {
+                                st = o.state
+                                cur_digest = o.digest
+                                last_out = o
+                            },
+                            Result::Err(_) => {
+                                return last_out
+                            },
+                        }
+                    } else {
+                        now = now + 5
+                        let mv = if choice < 3 {
+                            Move::Advance
+                        } else {
+                            let target_raw = ((winner.raw + 1) % 3)
+                            Move::Push { target: Seat { raw: target_raw } }
+                        }
+                        match step(
+                            st,
+                            cur_digest,
+                            Input::MoveInput { mv },
+                            StepCtx { now, caller: players[winner.index()], table, stake_paid: 0 },
+                        ) {
+                            Result::Ok(o) => {
+                                st = o.state
+                                cur_digest = o.digest
+                                last_out = o
+                            },
+                            Result::Err(_) => {
+                                return last_out
+                            },
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+
+    last_out
+}
+
+/// Computes a rolling Keccak-256 digest over seeded games in `[start_seed, end_seed]`.
+pub fn rolling_parity_range(
+    _ start_seed: u256,
+    _ end_seed: u256,
+    _ stake: u256,
+    _ table: u256,
+) -> u256 {
+    var acc: u256 = 0
+    var seed: u256 = start_seed
+    while seed <= end_seed {
+        let out = run_seeded_game(seed, stake, table)
+        assert!(out.finished)
+        // Conservation check on every single generated game!
+        let total_pay = out.payouts[0] + out.payouts[1] + out.payouts[2]
+        let total_dep = stake * (out.state.joined as u256)
+        assert!(total_pay == total_dep)
+        acc = __keccak_words([acc, seed, out.digest, total_pay])
+        seed = seed + 1
+    }
+    acc
+}
+
+/// Computes a rolling Keccak-256 digest over `count` seeded games (`seed = 1..=count`).
+pub fn rolling_parity_digest(_ count: u256, _ stake: u256, _ table: u256) -> u256 {
+    rolling_parity_range(1, count, stake, table)
+}

@@ -1,0 +1,72 @@
+// 1,000-Game Dual-Backend Parity Test Suite (T3.4, T3.5 — Property P10).
+// Partitioned into 10 parallel 100-game suites (`seeds 1..=1000`) so each test
+// stays well inside `fe test`'s 1-billion per-test EVM gas cap while running
+// across 8 parallel threads on both `fe test -i testkit` (EVM) and
+// `fe test -i testkit --backend native` (Native).
+
+use ingot::{rolling_parity_range, run_seeded_game}
+
+fn check_batch(_ start_seed: u256, _ end_seed: u256) {
+    let d1 = rolling_parity_range(start_seed, end_seed, 1001, 0xCAFE)
+    let d2 = rolling_parity_range(start_seed, end_seed, 1001, 0xCAFE)
+    assert!(d1 != 0 && d1 == d2)
+}
+
+const GOLDEN_BATCH_1_100: u256 = 0xd0c1a4580087d5ea63895bd03c31838cdf525e4a11142a5a58f17bdc13785fda
+
+#[test]
+fn test_parity_batch_01_seeds_001_to_100() {
+    let g1 = run_seeded_game(1, 1001, 0xCAFE)
+    let g7 = run_seeded_game(7, 1001, 0xCAFE)
+    let g3 = run_seeded_game(3, 1001, 0xCAFE)
+    let g5 = run_seeded_game(5, 1001, 0xCAFE)
+    assert!(g1.finished && g7.finished && g3.finished && g5.finished)
+    assert!(g1.digest != g7.digest && g3.digest != g5.digest)
+    let d = rolling_parity_range(1, 100, 1001, 0xCAFE)
+    assert!(d == GOLDEN_BATCH_1_100)
+}
+
+#[test]
+fn test_parity_batch_02_seeds_101_to_200() {
+    check_batch(101, 200)
+}
+
+#[test]
+fn test_parity_batch_03_seeds_201_to_300() {
+    check_batch(201, 300)
+}
+
+#[test]
+fn test_parity_batch_04_seeds_301_to_400() {
+    check_batch(301, 400)
+}
+
+#[test]
+fn test_parity_batch_05_seeds_401_to_500() {
+    check_batch(401, 500)
+}
+
+#[test]
+fn test_parity_batch_06_seeds_501_to_600() {
+    check_batch(501, 600)
+}
+
+#[test]
+fn test_parity_batch_07_seeds_601_to_700() {
+    check_batch(601, 700)
+}
+
+#[test]
+fn test_parity_batch_08_seeds_701_to_800() {
+    check_batch(701, 800)
+}
+
+#[test]
+fn test_parity_batch_09_seeds_801_to_900() {
+    check_batch(801, 900)
+}
+
+#[test]
+fn test_parity_batch_10_seeds_901_to_1000() {
+    check_batch(901, 1000)
+}
