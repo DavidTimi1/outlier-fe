@@ -1,0 +1,88 @@
+// Pure, money-conserving settlement logic (docs/SPEC.md §6).
+// Zero `uses` clauses.
+//
+// Property P5 (Anti-kingmaking by type): `settle_forfeit` does NOT accept `Positions`
+// or `round`, making it impossible at the type level for a timed abort to pay out
+// based on board positions.
+
+use ingot::types::{GameResult, Seat}
+
+/// Computes gross payouts `[p0, p1, p2]` for a forfeit outcome (`1 <= mask <= 7`).
+/// Depends ONLY on `mask` and `stake` (Property P5).
+pub fn settle_forfeit(_ mask: u8, _ stake: u256) -> [u256; 3] {
+    let f0 = (mask & 1) != 0
+    let f1 = (mask & 2) != 0
+    let f2 = (mask & 4) != 0
+
+    var count: u8 = 0
+    if f0 { count = count + 1 }
+    if f1 { count = count + 1 }
+    if f2 { count = count + 1 }
+
+    // All 3 forfeited (or invalid empty mask): refund everyone's stake
+    if count >= 3 || count == 0 {
+        return [stake, stake, stake]
+    }
+
+    // 2 forfeited: single survivor takes all 3 * stake
+    if count == 2 {
+        if !f0 {
+            return [stake * 3, 0, 0]
+        } else if !f1 {
+            return [0, stake * 3, 0]
+        } else {
+            return [0, 0, stake * 3]
+        }
+    }
+
+    // 1 forfeited: forfeiter gets 0; lower-indexed survivor gets stake + ceil(stake/2),
+    // higher-indexed survivor gets stake + floor(stake/2).
+    let low_share = stake + (stake - (stake / 2))
+    let high_share = stake + (stake / 2)
+
+    if f0 {
+        // Survivors are S1 (lower) and S2 (higher)
+        [0, low_share, high_share]
+    } else if f1 {
+        // Survivors are S0 (lower) and S2 (higher)
+        [low_share, 0, high_share]
+    } else {
+        // f2: Survivors are S0 (lower) and S1 (higher)
+        [low_share, high_share, 0]
+    }
+}
+
+/// Computes gross payouts `[p0, p1, p2]` for any terminal `GameResult`.
+/// Sum of payouts always equals total deposited (`joined * stake`).
+pub fn settle(_ result: GameResult, _ stake: u256) -> [u256; 3] {
+    match result {
+        GameResult::Won { winner } => {
+            if winner.raw == 0 {
+                [stake * 3, 0, 0]
+            } else if winner.raw == 1 {
+                [0, stake * 3, 0]
+            } else {
+                [0, 0, stake * 3]
+            }
+        },
+        GameResult::CapReached { leader } => match leader {
+            Option::None => [stake, stake, stake],
+            Option::Some(ldr) => {
+                if ldr.raw == 0 {
+                    [stake * 3, 0, 0]
+                } else if ldr.raw == 1 {
+                    [0, stake * 3, 0]
+                } else {
+                    [0, 0, stake * 3]
+                }
+            },
+        },
+        GameResult::Forfeited { mask } => settle_forfeit(mask, stake),
+        GameResult::Cancelled { joined } => {
+            let p0 = if joined >= 1 { stake } else { 0 }
+            let p1 = if joined >= 2 { stake } else { 0 }
+            let p2 = if joined >= 3 { stake } else { 0 }
+            [p0, p1, p2]
+        },
+    }
+}

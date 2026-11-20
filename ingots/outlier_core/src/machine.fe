@@ -1,0 +1,469 @@
+// Pure protocol state machine `step` for OUTLIER (docs/SPEC.md §5).
+// Zero `uses` clauses — all ambient inputs arrive through `StepCtx`.
+
+use ingot::encode::digest_next
+use ingot::errors::StepError
+use ingot::params::{COMMIT_WINDOW, JOIN_WINDOW, MOVE_WINDOW, REVEAL_WINDOW, ROUND_CAP}
+use ingot::rules::{apply_move, commitment, decode_move, leader, resolve}
+use ingot::settle::settle
+use ingot::types::{
+    Colour,
+    GameResult,
+    GameState,
+    Input,
+    InputEvent,
+    Move,
+    Outcome,
+    Phase,
+    Positions,
+    Seat,
+    SeatState,
+    StepCtx,
+    StepOut,
+}
+
+#[inline(never)]
+fn find_player_seat(_ players: [u256; 3], _ joined: u8, _ caller: u256) -> Option<Seat> {
+    if joined >= 1 && players[0] == caller {
+        Option::Some(Seat::s0())
+    } else if joined >= 2 && players[1] == caller {
+        Option::Some(Seat::s1())
+    } else if joined >= 3 && players[2] == caller {
+        Option::Some(Seat::s2())
+    } else {
+        Option::None
+    }
+}
+
+fn is_seat_empty(_ s: SeatState) -> bool {
+    match s {
+        SeatState::Empty => true,
+        _ => false,
+    }
+}
+
+fn is_seat_committed(_ s: SeatState) -> bool {
+    match s {
+        SeatState::Committed { .. } => true,
+        _ => false,
+    }
+}
+
+fn all_committed(_ seats: [SeatState; 3]) -> bool {
+    is_seat_committed(seats[0]) && is_seat_committed(seats[1]) && is_seat_committed(seats[2])
+}
+
+fn unrevealed_mask(_ seats: [SeatState; 3]) -> u8 {
+    var mask: u8 = 0
+    if is_seat_committed(seats[0]) {
+        mask = mask | 1
+    }
+    if is_seat_committed(seats[1]) {
+        mask = mask | 2
+    }
+    if is_seat_committed(seats[2]) {
+        mask = mask | 4
+    }
+    mask
+}
+
+fn uncommitted_mask(_ seats: [SeatState; 3]) -> u8 {
+    var mask: u8 = 0
+    if is_seat_empty(seats[0]) {
+        mask = mask | 1
+    }
+    if is_seat_empty(seats[1]) {
+        mask = mask | 2
+    }
+    if is_seat_empty(seats[2]) {
+        mask = mask | 4
+    }
+    mask
+}
+
+#[inline(never)]
+fn make_out(
+    _ next_state: GameState,
+    _ prev_digest: u256,
+    _ ev: InputEvent,
+    _ finished: bool,
+    _ payouts: [u256; 3],
+) -> StepOut {
+    let d = digest_next(prev_digest, next_state)
+    StepOut { state: next_state, input_event: ev, digest: d, finished, payouts }
+}
+
+#[inline(never)]
+fn finish_game(
+    _ state: GameState,
+    _ prev_digest: u256,
+    _ result: GameResult,
+    _ ev: InputEvent,
+) -> StepOut {
+    var next_state = state
+    next_state.step_no = state.step_no + 1
+    next_state.phase = Phase::Finished { result }
+    next_state.seats = [SeatState::Empty, SeatState::Empty, SeatState::Empty]
+    next_state.commits = [0, 0, 0]
+    let payouts = settle(result, state.stake)
+    make_out(next_state, prev_digest, ev, true, payouts)
+}
+
+#[inline(never)]
+fn start_new_game(_ state: GameState, _ ctx: StepCtx) -> Result<StepError, StepOut> {
+    if ctx.stake_paid != state.stake {
+        return Result::Err(StepError::WrongStake)
+    }
+    var next_state = GameState::new(state.stake)
+    next_state.game_id = state.game_id + 1
+    next_state.step_no = 1
+    next_state.phase = Phase::Registration { deadline: ctx.now + JOIN_WINDOW }
+    next_state.players = [ctx.caller, 0, 0]
+    next_state.joined = 1
+    // SPEC.md §8: digest_0 = 0 at the start of every game
+    Result::Ok(
+        make_out(
+            next_state,
+            0,
+            InputEvent::Joined { caller: ctx.caller, seat: Seat::s0() },
+            false,
+            [0, 0, 0],
+        ),
+    )
+}
+
+#[inline(never)]
+fn after_move_transition(
+    _ state: GameState,
+    _ prev_digest: u256,
+    _ round: u8,
+    _ winner: Seat,
+    _ new_positions: Positions,
+    _ now: u256,
+    _ ev: InputEvent,
+) -> StepOut {
+    var base = state
+    base.round = round
+    base.positions = new_positions
+
+    if new_positions.get(winner).is_finished() {
+        let res = GameResult::Won { winner }
+        return finish_game(base, prev_digest, res, ev)
+    }
+
+    if round >= ROUND_CAP {
+        let res = GameResult::CapReached { leader: leader(new_positions) }
+        return finish_game(base, prev_digest, res, ev)
+    }
+
+    let next_round = round + 1
+    base.step_no = state.step_no + 1
+    base.round = next_round
+    base.phase = Phase::Commit { round: next_round, deadline: now + COMMIT_WINDOW }
+    base.seats = [SeatState::Empty, SeatState::Empty, SeatState::Empty]
+    base.commits = [0, 0, 0]
+    make_out(base, prev_digest, ev, false, [0, 0, 0])
+}
+
+/// Executes one state transition of the OUTLIER protocol (`docs/SPEC.md §5.2`).
+/// Returns `Result::Ok(StepOut)` on a valid transition or `Result::Err(StepError)` without mutating `state`.
+pub fn step(_ state: GameState, _ prev_digest: u256, _ input: Input, _ ctx: StepCtx) -> Result<
+    StepError,
+    StepOut,
+> {
+    match state.phase {
+        Phase::Idle => match input {
+            Input::Join => start_new_game(state, ctx),
+            _ => Result::Err(StepError::WrongPhase),
+        },
+
+        Phase::Finished { .. } => match input {
+            Input::Join => start_new_game(state, ctx),
+            _ => Result::Err(StepError::GameFinished),
+        },
+
+        Phase::Registration { deadline } => match input {
+            Input::Join => {
+                if ctx.now > deadline {
+                    return Result::Err(StepError::DeadlinePassed)
+                }
+                match find_player_seat(state.players, state.joined, ctx.caller) {
+                    Option::Some(_) => {
+                        return Result::Err(StepError::DuplicatePlayer)
+                    },
+                    Option::None => {},
+                }
+                if ctx.stake_paid != state.stake {
+                    return Result::Err(StepError::WrongStake)
+                }
+
+                let seat_idx = state.joined
+                let seat = Seat { raw: seat_idx }
+                var next_state = state
+                next_state.step_no = state.step_no + 1
+                next_state.players[seat_idx as usize] = ctx.caller
+                let new_joined = state.joined + 1
+                next_state.joined = new_joined
+
+                if new_joined == 3 {
+                    next_state.phase = Phase::Commit { round: 1, deadline: ctx.now + COMMIT_WINDOW }
+                    next_state.round = 1
+                }
+                Result::Ok(
+                    make_out(
+                        next_state,
+                        prev_digest,
+                        InputEvent::Joined { caller: ctx.caller, seat },
+                        false,
+                        [0, 0, 0],
+                    ),
+                )
+            },
+            Input::Poke => {
+                if ctx.now <= deadline {
+                    return Result::Err(StepError::DeadlineNotPassed)
+                }
+                Result::Ok(
+                    finish_game(
+                        state,
+                        prev_digest,
+                        GameResult::Cancelled { joined: state.joined },
+                        InputEvent::Poked { caller: ctx.caller },
+                    ),
+                )
+            },
+            _ => Result::Err(StepError::WrongPhase),
+        },
+
+        Phase::Commit { round, deadline } => match input {
+            Input::Commit { hash } => {
+                let seat = match find_player_seat(state.players, state.joined, ctx.caller) {
+                    Option::None => {
+                        return Result::Err(StepError::NotAPlayer)
+                    },
+                    Option::Some(s) => s,
+                }
+                if ctx.now > deadline {
+                    return Result::Err(StepError::DeadlinePassed)
+                }
+                if !is_seat_empty(state.seats[seat.index()]) {
+                    return Result::Err(StepError::AlreadyCommitted)
+                }
+                if hash == 0 {
+                    return Result::Err(StepError::InvalidCommitment)
+                }
+
+                var next_state = state
+                next_state.step_no = state.step_no + 1
+                next_state.seats[seat.index()] = SeatState::Committed { hash }
+                next_state.commits[seat.index()] = hash
+                if all_committed(next_state.seats) {
+                    next_state.phase = Phase::Reveal { round, deadline: ctx.now + REVEAL_WINDOW }
+                }
+                Result::Ok(
+                    make_out(
+                        next_state,
+                        prev_digest,
+                        InputEvent::Committed { seat, hash },
+                        false,
+                        [0, 0, 0],
+                    ),
+                )
+            },
+            Input::Poke => {
+                if ctx.now <= deadline {
+                    return Result::Err(StepError::DeadlineNotPassed)
+                }
+                let mask = uncommitted_mask(state.seats)
+                Result::Ok(
+                    finish_game(
+                        state,
+                        prev_digest,
+                        GameResult::Forfeited { mask },
+                        InputEvent::Poked { caller: ctx.caller },
+                    ),
+                )
+            },
+            _ => Result::Err(StepError::WrongPhase),
+        },
+
+        Phase::Reveal { round, deadline } => match input {
+            Input::Reveal { colour_raw, nonce } => {
+                let seat = match find_player_seat(state.players, state.joined, ctx.caller) {
+                    Option::None => {
+                        return Result::Err(StepError::NotAPlayer)
+                    },
+                    Option::Some(s) => s,
+                }
+                if ctx.now > deadline {
+                    return Result::Err(StepError::DeadlinePassed)
+                }
+                let stored_hash = match state.seats[seat.index()] {
+                    SeatState::Committed { hash } => hash,
+                    _ => {
+                        return Result::Err(StepError::AlreadyRevealed)
+                    },
+                }
+                let colour = match Colour::from_u8(colour_raw) {
+                    Option::None => {
+                        return Result::Err(StepError::InvalidColour)
+                    },
+                    Option::Some(c) => c,
+                }
+                let expected = commitment(
+                    table: ctx.table,
+                    game_id: state.game_id,
+                    round: round as u256,
+                    seat,
+                    colour,
+                    nonce,
+                )
+                if expected != stored_hash {
+                    return Result::Err(StepError::BadReveal)
+                }
+
+                var next_state = state
+                next_state.step_no = state.step_no + 1
+                next_state.seats[seat.index()] = SeatState::Revealed { colour }
+                let ev = InputEvent::Revealed { seat, colour, nonce }
+
+                match (next_state.seats[0], next_state.seats[1], next_state.seats[2]) {
+                    (
+                        SeatState::Revealed { colour: c0 },
+                        SeatState::Revealed { colour: c1 },
+                        SeatState::Revealed { colour: c2 },
+                    ) => match resolve(c0, c1, c2) {
+                        Outcome::Winner { seat: w } => {
+                            next_state.phase = Phase::WinnerMove {
+                                round,
+                                winner: w,
+                                deadline: ctx.now + MOVE_WINDOW,
+                            }
+                            Result::Ok(make_out(next_state, prev_digest, ev, false, [0, 0, 0]))
+                        },
+                        Outcome::NoWinner => {
+                            if round >= ROUND_CAP {
+                                let res = GameResult::CapReached { leader: leader(state.positions) }
+                                Result::Ok(finish_game(state, prev_digest, res, ev))
+                            } else {
+                                let next_round = round + 1
+                                next_state.round = next_round
+                                next_state.phase = Phase::Commit {
+                                    round: next_round,
+                                    deadline: ctx.now + COMMIT_WINDOW,
+                                }
+                                next_state.seats = [
+                                    SeatState::Empty,
+                                    SeatState::Empty,
+                                    SeatState::Empty,
+                                ]
+                                next_state.commits = [0, 0, 0]
+                                Result::Ok(make_out(next_state, prev_digest, ev, false, [0, 0, 0]))
+                            }
+                        },
+                    },
+                    _ => Result::Ok(make_out(next_state, prev_digest, ev, false, [0, 0, 0])),
+                }
+            },
+            Input::Poke => {
+                if ctx.now <= deadline {
+                    return Result::Err(StepError::DeadlineNotPassed)
+                }
+                let mask = unrevealed_mask(state.seats)
+                Result::Ok(
+                    finish_game(
+                        state,
+                        prev_digest,
+                        GameResult::Forfeited { mask },
+                        InputEvent::Poked { caller: ctx.caller },
+                    ),
+                )
+            },
+            _ => Result::Err(StepError::WrongPhase),
+        },
+
+        Phase::WinnerMove { round, winner, deadline } => match input {
+            Input::MoveInput { mv } => {
+                let caller_seat = match find_player_seat(state.players, state.joined, ctx.caller) {
+                    Option::None => {
+                        return Result::Err(StepError::NotAPlayer)
+                    },
+                    Option::Some(s) => s,
+                }
+                if !caller_seat.eq(winner) {
+                    return Result::Err(StepError::NotYourMove)
+                }
+                if ctx.now > deadline {
+                    return Result::Err(StepError::DeadlinePassed)
+                }
+                let new_positions = match apply_move(state.positions, winner, mv) {
+                    Result::Err(e) => {
+                        return Result::Err(e)
+                    },
+                    Result::Ok(p) => p,
+                }
+                Result::Ok(
+                    after_move_transition(
+                        state,
+                        prev_digest,
+                        round,
+                        winner,
+                        new_positions,
+                        ctx.now,
+                        InputEvent::MoveMade { seat: winner, mv },
+                    ),
+                )
+            },
+            Input::Poke => {
+                if ctx.now <= deadline {
+                    return Result::Err(StepError::DeadlineNotPassed)
+                }
+                let new_positions = match apply_move(state.positions, winner, Move::Advance) {
+                    Result::Err(e) => {
+                        return Result::Err(e)
+                    },
+                    Result::Ok(p) => p,
+                }
+                Result::Ok(
+                    after_move_transition(
+                        state,
+                        prev_digest,
+                        round,
+                        winner,
+                        new_positions,
+                        ctx.now,
+                        InputEvent::MoveDefaulted { seat: winner },
+                    ),
+                )
+            },
+            _ => Result::Err(StepError::WrongPhase),
+        },
+    }
+}
+
+/// Executes a move transition from raw `(kind, target_raw)` arguments while preserving
+/// the exact SPEC.md §5.2 error priority (`WrongPhase`/`GameFinished` -> `NotAPlayer`
+/// -> `NotYourMove` -> `DeadlinePassed` -> `InvalidMove`).
+pub fn step_move_raw(
+    _ state: GameState,
+    _ prev_digest: u256,
+    _ kind: u8,
+    _ target_raw: u8,
+    _ ctx: StepCtx,
+) -> Result<StepError, StepOut> {
+    match decode_move(kind, target_raw) {
+        Result::Ok(mv) => step(state, prev_digest, Input::MoveInput { mv }, ctx),
+        Result::Err(_) => {
+            let invalid_mv = match state.phase {
+                Phase::WinnerMove { winner, .. } => Move::Push { target: winner },
+                _ => Move::Advance,
+            }
+            step(
+                state,
+                prev_digest,
+                Input::MoveInput { mv: invalid_mv },
+                ctx,
+            )
+        },
+    }
+}

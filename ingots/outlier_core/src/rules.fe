@@ -1,0 +1,127 @@
+// Pure game rules for OUTLIER (docs/SPEC.md §4, §7).
+// Zero `uses` clauses — statically guaranteed free of storage, clock, caller, or I/O effects.
+
+use ingot::commit_reveal::{CommitmentHash, commit_hash}
+use ingot::errors::StepError
+use ingot::params::DOMAIN_TAG
+use ingot::types::{Colour, Input, Move, Outcome, Phase, Position, Positions, Seat}
+
+/// Resolves a round's 3 revealed colours:
+/// - All equal -> `Outcome::NoWinner`
+/// - All distinct -> `Outcome::NoWinner`
+/// - Exactly two equal -> `Outcome::Winner { seat: odd_one_out }`
+pub fn resolve(_ c0: Colour, _ c1: Colour, _ c2: Colour) -> Outcome {
+    if c0.eq(c1) && c1.eq(c2) {
+        return Outcome::NoWinner
+    }
+    if !c0.eq(c1) && !c1.eq(c2) && !c0.eq(c2) {
+        return Outcome::NoWinner
+    }
+    if c0.eq(c1) {
+        Outcome::Winner { seat: Seat::s2() }
+    } else if c0.eq(c2) {
+        Outcome::Winner { seat: Seat::s1() }
+    } else {
+        Outcome::Winner { seat: Seat::s0() }
+    }
+}
+
+/// Decodes a raw `(kind, target_raw)` pair into a typed `Move`:
+/// - `kind == 0 && target_raw == 0` -> `Result::Ok(Move::Advance)`
+/// - `kind == 1` and `target_raw <= 2` -> `Result::Ok(Move::Push { target })`
+/// - anything else -> `Result::Err(StepError::InvalidMove)`
+pub fn decode_move(_ kind: u8, _ target_raw: u8) -> Result<StepError, Move> {
+    if kind == 0 {
+        if target_raw == 0 {
+            Result::Ok(Move::Advance)
+        } else {
+            Result::Err(StepError::InvalidMove)
+        }
+    } else if kind == 1 {
+        match Seat::from_u8(target_raw) {
+            Option::Some(t) => Result::Ok(Move::Push { target: t }),
+            Option::None => Result::Err(StepError::InvalidMove),
+        }
+    } else {
+        Result::Err(StepError::InvalidMove)
+    }
+}
+
+/// Converts raw `(kind, target_raw)` move parameters into a typed `Input::MoveInput`
+/// while preserving SPEC.md §5.2 error priority (`WrongPhase`/`GameFinished` -> `NotAPlayer`
+/// -> `NotYourMove` -> `DeadlinePassed` -> `InvalidMove`).
+pub fn make_move_input(_ phase: Phase, _ kind: u8, _ target_raw: u8) -> Input {
+    match decode_move(kind, target_raw) {
+        Result::Ok(mv) => Input::MoveInput { mv },
+        Result::Err(_) => {
+            let invalid_mv = match phase {
+                Phase::WinnerMove { winner, .. } => Move::Push { target: winner },
+                _ => Move::Advance,
+            }
+            Input::MoveInput { mv: invalid_mv }
+        },
+    }
+}
+
+/// Applies the round winner's move to `positions`:
+/// - `Move::Advance` increments `positions[winner]` (saturating at `FINISH`).
+/// - `Move::Push { target }` requires `target != winner` (else `Err(StepError::InvalidMove)`)
+///   and decrements `positions[target]` by `PUSH` (saturating at `0`).
+pub fn apply_move(_ positions: Positions, _ winner: Seat, _ mv: Move) -> Result<
+    StepError,
+    Positions,
+> {
+    match mv {
+        Move::Advance => {
+            let next_pos = positions.get(winner).advance()
+            Result::Ok(positions.set(winner, next_pos))
+        },
+        Move::Push { target } => {
+            if target.eq(winner) {
+                Result::Err(StepError::InvalidMove)
+            } else {
+                let next_pos = positions.get(target).push_back()
+                Result::Ok(positions.set(target, next_pos))
+            }
+        },
+    }
+}
+
+/// Returns `Some(seat)` if `seat` holds the strictly highest position, or `None` on a tie.
+pub fn leader(_ positions: Positions) -> Option<Seat> {
+    let a = positions.p0.to_u8()
+    let b = positions.p1.to_u8()
+    let c = positions.p2.to_u8()
+
+    if a > b && a > c {
+        Option::Some(Seat::s0())
+    } else if b > a && b > c {
+        Option::Some(Seat::s1())
+    } else if c > a && c > b {
+        Option::Some(Seat::s2())
+    } else {
+        Option::None
+    }
+}
+
+/// Computes the canonical 7-word OUTLIER commitment hash:
+/// `keccak256(abi.encode(DOMAIN_TAG, table, game_id, round, seat, colour, nonce))`
+pub fn commitment(
+    table: u256,
+    game_id: u256,
+    round: u256,
+    seat: Seat,
+    colour: Colour,
+    nonce: u256,
+) -> u256 {
+    let h: CommitmentHash = commit_hash(
+        domain_tag: DOMAIN_TAG,
+        context: table,
+        session_id: game_id,
+        round,
+        participant: seat.to_u256(),
+        choice: colour.to_u256(),
+        nonce,
+    )
+    h.word()
+}

@@ -1,0 +1,95 @@
+// Canonical 15-word state encoding and 16-word Keccak-256 digest chain (docs/SPEC.md §8).
+// Identical on EVM (`sonatina`) and `native` backends.
+
+use core::intrinsic::__keccak_words
+use ingot::types::{GameResult, GameState, Phase, SeatState}
+
+fn seat_state_tag(_ s: SeatState) -> u256 {
+    match s {
+        SeatState::Empty => 0,
+        SeatState::Committed { .. } => 1,
+        SeatState::Revealed { .. } => 2,
+    }
+}
+
+fn seat_revealed_colour(_ s: SeatState) -> u256 {
+    match s {
+        SeatState::Revealed { colour } => colour.to_u256(),
+        _ => 0,
+    }
+}
+
+fn pack_w6(_ phase: Phase) -> u256 {
+    match phase {
+        Phase::WinnerMove { winner, .. } => (winner.to_u256() + 1),
+        Phase::Finished { result } => match result {
+            GameResult::Won { winner } => (1 << 8) | (winner.to_u256() << 16),
+            GameResult::CapReached { leader } => {
+                let ldr_plus_one: u256 = match leader {
+                    Option::None => 0,
+                    Option::Some(s) => s.to_u256() + 1,
+                }
+                (2 << 8) | (ldr_plus_one << 16)
+            },
+            GameResult::Forfeited { mask } => (3 << 8) | ((mask as u256) << 16),
+            GameResult::Cancelled { joined } => (4 << 8) | ((joined as u256) << 16),
+        },
+        _ => 0,
+    }
+}
+
+fn pack_w7(_ seats: [SeatState; 3]) -> u256 {
+    let tags = seat_state_tag(seats[0])
+        | (seat_state_tag(seats[1]) << 2)
+        | (seat_state_tag(seats[2]) << 4)
+    let cols = seat_revealed_colour(seats[0])
+        | (seat_revealed_colour(seats[1]) << 2)
+        | (seat_revealed_colour(seats[2]) << 4)
+    tags | (cols << 8)
+}
+
+/// Encodes `GameState` into the 15 canonical words `w0..w14` defined in `docs/SPEC.md §8`.
+pub fn encode_state(_ s: GameState) -> [u256; 15] {
+    [
+        s.game_id,
+        s.step_no,
+        s.phase.tag() as u256,
+        s.phase.deadline(),
+        s.round as u256,
+        s.positions.packed(),
+        pack_w6(s.phase),
+        pack_w7(s.seats),
+        s.commits[0],
+        s.commits[1],
+        s.commits[2],
+        s.players[0],
+        s.players[1],
+        s.players[2],
+        s.joined as u256,
+    ]
+}
+
+/// Computes `digest_n = keccak256(abi.encode(prev_digest, w0..w14))` over 16 words (512 bytes).
+pub fn digest_next(_ prev_digest: u256, _ s: GameState) -> u256 {
+    let w = encode_state(s)
+    __keccak_words(
+        [
+            prev_digest,
+            w[0],
+            w[1],
+            w[2],
+            w[3],
+            w[4],
+            w[5],
+            w[6],
+            w[7],
+            w[8],
+            w[9],
+            w[10],
+            w[11],
+            w[12],
+            w[13],
+            w[14],
+        ],
+    )
+}
