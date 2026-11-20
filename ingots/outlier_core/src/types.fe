@@ -1,0 +1,333 @@
+// Domain types and validated constructors for OUTLIER (docs/SPEC.md §3).
+
+use ingot::params::{FINISH, PUSH}
+
+pub struct Seat { pub raw: u8 }
+
+impl Copy for Seat {}
+
+impl Seat {
+    pub fn s0() -> Seat {
+        Seat { raw: 0 }
+    }
+
+    pub fn s1() -> Seat {
+        Seat { raw: 1 }
+    }
+
+    pub fn s2() -> Seat {
+        Seat { raw: 2 }
+    }
+
+    pub fn from_u8(_ raw: u8) -> Option<Seat> {
+        if raw <= 2 {
+            Option::Some(Seat { raw })
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn index(self) -> usize {
+        self.raw as usize
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self.raw
+    }
+
+    pub fn to_u256(self) -> u256 {
+        self.raw as u256
+    }
+
+    pub fn eq(self, _ other: Seat) -> bool {
+        self.raw == other.raw
+    }
+}
+
+pub enum Colour {
+    Red,
+    Blue,
+    Green,
+}
+
+impl Copy for Colour {}
+
+impl Colour {
+    pub fn from_u8(_ raw: u8) -> Option<Colour> {
+        if raw == 0 {
+            Option::Some(Colour::Red)
+        } else if raw == 1 {
+            Option::Some(Colour::Blue)
+        } else if raw == 2 {
+            Option::Some(Colour::Green)
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Colour::Red => 0,
+            Colour::Blue => 1,
+            Colour::Green => 2,
+        }
+    }
+
+    pub fn to_u256(self) -> u256 {
+        self.to_u8() as u256
+    }
+
+    pub fn eq(self, _ other: Colour) -> bool {
+        self.to_u8() == other.to_u8()
+    }
+}
+
+pub struct Position { pub raw: u8 }
+
+impl Copy for Position {}
+
+impl Position {
+    pub fn zero() -> Position {
+        Position { raw: 0 }
+    }
+
+    pub fn from_u8(_ raw: u8) -> Option<Position> {
+        if raw <= FINISH {
+            Option::Some(Position { raw })
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn advance(self) -> Position {
+        if self.raw >= FINISH {
+            Position { raw: FINISH }
+        } else {
+            Position { raw: self.raw + 1 }
+        }
+    }
+
+    pub fn push_back(self) -> Position {
+        if self.raw <= PUSH {
+            Position { raw: 0 }
+        } else {
+            Position { raw: self.raw - PUSH }
+        }
+    }
+
+    pub fn is_finished(self) -> bool {
+        self.raw == FINISH
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self.raw
+    }
+
+    pub fn to_u256(self) -> u256 {
+        self.raw as u256
+    }
+
+    pub fn eq(self, _ other: Position) -> bool {
+        self.raw == other.raw
+    }
+}
+
+pub struct Positions { pub p0: Position, pub p1: Position, pub p2: Position }
+
+impl Copy for Positions {}
+
+impl Positions {
+    pub fn initial() -> Positions {
+        Positions { p0: Position::zero(), p1: Position::zero(), p2: Position::zero() }
+    }
+
+    pub fn new(_ a: u8, _ b: u8, _ c: u8) -> Option<Positions> {
+        match Position::from_u8(a) {
+            Option::None => Option::None,
+            Option::Some(p0) => match Position::from_u8(b) {
+                Option::None => Option::None,
+                Option::Some(p1) => match Position::from_u8(c) {
+                    Option::None => Option::None,
+                    Option::Some(p2) => Option::Some(Positions { p0, p1, p2 }),
+                },
+            },
+        }
+    }
+
+    pub fn get(self, _ seat: Seat) -> Position {
+        if seat.raw == 0 {
+            self.p0
+        } else if seat.raw == 1 { self.p1 } else { self.p2 }
+    }
+
+    pub fn set(self, _ seat: Seat, _ pos: Position) -> Positions {
+        if seat.raw == 0 {
+            Positions { p0: pos, p1: self.p1, p2: self.p2 }
+        } else if seat.raw == 1 {
+            Positions { p0: self.p0, p1: pos, p2: self.p2 }
+        } else {
+            Positions { p0: self.p0, p1: self.p1, p2: pos }
+        }
+    }
+
+    pub fn packed(self) -> u256 {
+        (self.p0.to_u256()) | (self.p1.to_u256() << 8) | (self.p2.to_u256() << 16)
+    }
+
+    pub fn eq(self, _ other: Positions) -> bool {
+        self.p0.eq(other.p0) && self.p1.eq(other.p1) && self.p2.eq(other.p2)
+    }
+}
+
+pub enum Outcome {
+    NoWinner,
+    Winner { pub seat: Seat },
+}
+
+impl Copy for Outcome {}
+
+pub enum Move {
+    Advance,
+    Push { pub target: Seat },
+}
+
+impl Copy for Move {}
+
+pub enum SeatState {
+    Empty,
+    Committed { pub hash: u256 },
+    Revealed { pub colour: Colour },
+}
+
+impl Copy for SeatState {}
+
+pub enum GameResult {
+    Won { pub winner: Seat },
+    CapReached { pub leader: Option<Seat> },
+    Forfeited { pub mask: u8 },
+    Cancelled { pub joined: u8 },
+}
+
+impl Copy for GameResult {}
+
+pub enum Phase {
+    Idle,
+    Registration { pub deadline: u256 },
+    Commit {
+        pub round: u8,
+        pub deadline: u256,
+    },
+    Reveal {
+        pub round: u8,
+        pub deadline: u256,
+    },
+    WinnerMove {
+        pub round: u8,
+        pub winner: Seat,
+        pub deadline: u256,
+    },
+    Finished { pub result: GameResult },
+}
+
+impl Copy for Phase {}
+
+impl Phase {
+    pub fn tag(self) -> u8 {
+        match self {
+            Phase::Idle => 0,
+            Phase::Registration { .. } => 1,
+            Phase::Commit { .. } => 2,
+            Phase::Reveal { .. } => 3,
+            Phase::WinnerMove { .. } => 4,
+            Phase::Finished { .. } => 5,
+        }
+    }
+
+    pub fn deadline(self) -> u256 {
+        match self {
+            Phase::Idle => 0,
+            Phase::Registration { deadline } => deadline,
+            Phase::Commit { deadline, .. } => deadline,
+            Phase::Reveal { deadline, .. } => deadline,
+            Phase::WinnerMove { deadline, .. } => deadline,
+            Phase::Finished { .. } => 0,
+        }
+    }
+}
+
+pub enum Input {
+    Join,
+    Commit { pub hash: u256 },
+    Reveal {
+        pub colour_raw: u8,
+        pub nonce: u256,
+    },
+    MoveInput { pub mv: Move },
+    Poke,
+}
+
+impl Copy for Input {}
+
+pub struct StepCtx { pub now: u256, pub caller: u256, pub table: u256, pub stake_paid: u256 }
+
+impl Copy for StepCtx {}
+
+pub enum InputEvent {
+    Joined {
+        pub caller: u256,
+        pub seat: Seat,
+    },
+    Committed { pub seat: Seat, pub hash: u256 },
+    Revealed {
+        pub seat: Seat,
+        pub colour: Colour,
+        pub nonce: u256,
+    },
+    MoveMade { pub seat: Seat, pub mv: Move },
+    MoveDefaulted { pub seat: Seat },
+    Poked { pub caller: u256 },
+}
+
+impl Copy for InputEvent {}
+
+pub struct GameState {
+    pub game_id: u256,
+    pub step_no: u256,
+    pub stake: u256,
+    pub phase: Phase,
+    pub round: u8,
+    pub positions: Positions,
+    pub seats: [SeatState; 3],
+    pub commits: [u256; 3],
+    pub players: [u256; 3],
+    pub joined: u8,
+}
+
+impl Copy for GameState {}
+
+impl GameState {
+    pub fn new(_ stake: u256) -> GameState {
+        GameState {
+            game_id: 0,
+            step_no: 0,
+            stake,
+            phase: Phase::Idle,
+            round: 0,
+            positions: Positions::initial(),
+            seats: [SeatState::Empty, SeatState::Empty, SeatState::Empty],
+            commits: [0, 0, 0],
+            players: [0, 0, 0],
+            joined: 0,
+        }
+    }
+}
+
+pub struct StepOut {
+    pub state: GameState,
+    pub input_event: InputEvent,
+    pub digest: u256,
+    pub finished: bool,
+    pub payouts: [u256; 3],
+}
+
+impl Copy for StepOut {}

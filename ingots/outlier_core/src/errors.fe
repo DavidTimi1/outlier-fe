@@ -1,0 +1,45 @@
+// All 14 protocol errors defined in docs/SPEC.md §9.
+
+pub enum StepError {
+    WrongPhase,
+    GameFinished,
+    NotAPlayer,
+    NotYourMove,
+    DuplicatePlayer,
+    WrongStake,
+    DeadlinePassed,
+    DeadlineNotPassed,
+    AlreadyCommitted,
+    AlreadyRevealed,
+    InvalidCommitment,
+    InvalidColour,
+    BadReveal,
+    InvalidMove,
+}
+
+impl Copy for StepError {}
+
+impl StepError {
+    pub fn code(self) -> u8 {
+        match self {
+            StepError::WrongPhase => 1,
+            StepError::GameFinished => 2,
+            StepError::NotAPlayer => 3,
+            StepError::NotYourMove => 4,
+            StepError::DuplicatePlayer => 5,
+            StepError::WrongStake => 6,
+            StepError::DeadlinePassed => 7,
+            StepError::DeadlineNotPassed => 8,
+            StepError::AlreadyCommitted => 9,
+            StepError::AlreadyRevealed => 10,
+            StepError::InvalidCommitment => 11,
+            StepError::InvalidColour => 12,
+            StepError::BadReveal => 13,
+            StepError::InvalidMove => 14,
+        }
+    }
+
+    pub fn eq(self, _ other: StepError) -> bool {
+        self.code() == other.code()
+    }
+}

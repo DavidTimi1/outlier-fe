@@ -1,0 +1,87 @@
+// Reusable, game-agnostic commit-reveal primitives (docs/SPEC.md §7, docs/PATTERN.md).
+// Zero dependency on OUTLIER game rules: hashes a 7-word domain-separated preimage
+// identically on both EVM (`sonatina`) and `native` backends.
+
+use core::intrinsic::__keccak_words
+
+pub struct CommitmentHash { pub raw: u256 }
+
+impl Copy for CommitmentHash {}
+
+impl CommitmentHash {
+    pub fn zero() -> CommitmentHash {
+        CommitmentHash { raw: 0 }
+    }
+
+    /// Validates that the commitment word is non-zero (0 is the empty sentinel).
+    pub fn from_word(_ w: u256) -> Option<CommitmentHash> {
+        if w == 0 {
+            Option::None
+        } else {
+            Option::Some(CommitmentHash { raw: w })
+        }
+    }
+
+    pub fn word(self) -> u256 {
+        self.raw
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.raw == 0
+    }
+
+    pub fn eq(self, _ other: CommitmentHash) -> bool {
+        self.raw == other.raw
+    }
+}
+
+/// Generic 3-state lifecycle for a single participant's commit-reveal slot.
+pub enum CommitSlot<T> {
+    Empty,
+    Committed { pub hash: CommitmentHash },
+    Revealed { pub value: T },
+}
+
+/// Computes `keccak256(abi.encode(domain_tag, context, session_id, round, participant, choice, nonce))`
+/// over 7 big-endian 32-byte words (224 bytes).
+pub fn commit_hash(
+    domain_tag: u256,
+    context: u256,
+    session_id: u256,
+    round: u256,
+    participant: u256,
+    choice: u256,
+    nonce: u256,
+) -> CommitmentHash {
+    CommitmentHash {
+        raw: __keccak_words(
+            [domain_tag, context, session_id, round, participant, choice, nonce],
+        ),
+    }
+}
+
+/// Verifies a revealed `(choice, nonce)` against a stored `CommitmentHash`.
+pub fn verify_commit(
+    stored: CommitmentHash,
+    domain_tag: u256,
+    context: u256,
+    session_id: u256,
+    round: u256,
+    participant: u256,
+    choice: u256,
+    nonce: u256,
+) -> bool {
+    if stored.is_zero() {
+        return false
+    }
+    let computed = commit_hash(
+        domain_tag,
+        context,
+        session_id,
+        round,
+        participant,
+        choice,
+        nonce,
+    )
+    computed.eq(stored)
+}
