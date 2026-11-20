@@ -1,0 +1,891 @@
+// Comprehensive, backend-neutral verification suite for `outlier_core` (T2.2–T2.7).
+// Must pass identically on both `fe test` (EVM) and `fe test --backend native`.
+
+use ingot::{
+    COMMIT_WINDOW,
+    Colour,
+    CommitmentHash,
+    DOMAIN_TAG,
+    FINISH,
+    GameResult,
+    GameState,
+    Input,
+    JOIN_WINDOW,
+    MOVE_WINDOW,
+    Move,
+    Outcome,
+    PUSH,
+    Phase,
+    Position,
+    Positions,
+    REVEAL_WINDOW,
+    ROUND_CAP,
+    Seat,
+    SeatState,
+    StepCtx,
+    StepError,
+    StepOut,
+    apply_move,
+    commit_hash,
+    commitment,
+    digest_next,
+    encode_state,
+    leader,
+    resolve,
+    settle,
+    settle_forfeit,
+    step,
+    verify_commit,
+}
+
+fn unwrap_colour(_ raw: u8) -> Colour {
+    match Colour::from_u8(raw) {
+        Option::Some(c) => c,
+        Option::None => Colour::Red,
+    }
+}
+
+fn unwrap_seat(_ raw: u8) -> Seat {
+    match Seat::from_u8(raw) {
+        Option::Some(s) => s,
+        Option::None => Seat::s0(),
+    }
+}
+
+fn unwrap_pos(_ raw: u8) -> Position {
+    match Position::from_u8(raw) {
+        Option::Some(p) => p,
+        Option::None => Position::zero(),
+    }
+}
+
+fn assert_step_err(_ res: Result<StepError, StepOut>, _ expected: StepError) {
+    match res {
+        Result::Ok(_) => assert!(false),
+        Result::Err(e) => assert!(e.eq(expected)),
+    }
+}
+
+fn unwrap_step(_ res: Result<StepError, StepOut>) -> StepOut {
+    match res {
+        Result::Ok(out) => out,
+        Result::Err(_) => {
+            assert!(false)
+            StepOut {
+                state: GameState::new(0),
+                input_event: ingot::InputEvent::Poked { caller: 0 },
+                digest: 0,
+                finished: false,
+                payouts: [0, 0, 0],
+            }
+        },
+    }
+}
+
+// ============================================================================
+// T2.2 — Exhaustive 27-combination stage-game test (Property P0)
+// ============================================================================
+#[test]
+fn test_p0_exhaustive_stage_game() {
+    // Reject invalid raw colours > 2
+    assert!(
+        match Colour::from_u8(3) {
+            Option::None => true,
+            Option::Some(_) => false,
+        },
+    )
+    assert!(
+        match Colour::from_u8(255) {
+            Option::None => true,
+            Option::Some(_) => false,
+        },
+    )
+
+    var winner_combos: u8 = 0
+    var no_winner: u8 = 0
+    var all_same: u8 = 0
+    var all_distinct: u8 = 0
+    var wins_per_seat: [u8; 3] = [0, 0, 0]
+    var s0_wins_per_own_colour: [u8; 3] = [0, 0, 0]
+
+    var a: u8 = 0
+    while a < 3 {
+        var b: u8 = 0
+        while b < 3 {
+            var c: u8 = 0
+            while c < 3 {
+                let ca = unwrap_colour(a)
+                let cb = unwrap_colour(b)
+                let cc = unwrap_colour(c)
+                match resolve(ca, cb, cc) {
+                    Outcome::NoWinner => {
+                        no_winner = no_winner + 1
+                        if a == b && b == c {
+                            all_same = all_same + 1
+                        } else {
+                            assert!(a != b && b != c && a != c)
+                            all_distinct = all_distinct + 1
+                        }
+                    },
+                    Outcome::Winner { seat } => {
+                        winner_combos = winner_combos + 1
+                        let idx = seat.index()
+                        wins_per_seat[idx] = wins_per_seat[idx] + 1
+                        if seat.raw == 0 {
+                            assert!(b == c && a != b)
+                            s0_wins_per_own_colour[a as usize] = s0_wins_per_own_colour[a as usize]
+                                + 1
+                        } else if seat.raw == 1 {
+                            assert!(a == c && b != a)
+                        } else {
+                            assert!(a == b && c != a)
+                        }
+                    },
+                }
+                c = c + 1
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    assert!(winner_combos == 18)
+    assert!(no_winner == 9)
+    assert!(all_same == 3)
+    assert!(all_distinct == 6)
+    assert!(
+        wins_per_seat[0] == 6 && wins_per_seat[1] == 6 && wins_per_seat[2] == 6,
+    )
+    // Uniform indifference: for any fixed own colour, Seat 0 wins exactly 2 of 9 opponent pairs
+    assert!(
+        s0_wins_per_own_colour[0] == 2
+            && s0_wins_per_own_colour[1] == 2
+            && s0_wins_per_own_colour[2] == 2,
+    )
+}
+
+// ============================================================================
+// T2.3 — Exhaustive 125-position × 3-winner × 4-move test
+// ============================================================================
+#[test]
+fn test_exhaustive_apply_move_and_leader() {
+    assert!(
+        match Position::from_u8(FINISH + 1) {
+            Option::None => true,
+            Option::Some(_) => false,
+        },
+    )
+
+    var p0: u8 = 0
+    while p0 <= FINISH {
+        var p1: u8 = 0
+        while p1 <= FINISH {
+            var p2: u8 = 0
+            while p2 <= FINISH {
+                let pos = Positions { p0: unwrap_pos(p0), p1: unwrap_pos(p1), p2: unwrap_pos(p2) }
+
+                // Verify leader()
+                let ldr = leader(pos)
+                if p0 > p1 && p0 > p2 {
+                    match ldr {
+                        Option::Some(s) => assert!(s.raw == 0),
+                        Option::None => assert!(false),
+                    }
+                } else if p1 > p0 && p1 > p2 {
+                    match ldr {
+                        Option::Some(s) => assert!(s.raw == 1),
+                        Option::None => assert!(false),
+                    }
+                } else if p2 > p0 && p2 > p1 {
+                    match ldr {
+                        Option::Some(s) => assert!(s.raw == 2),
+                        Option::None => assert!(false),
+                    }
+                } else {
+                    match ldr {
+                        Option::None => assert!(true),
+                        Option::Some(_) => assert!(false),
+                    }
+                }
+
+                // Verify apply_move for every winner w in 0..=2
+                var w: u8 = 0
+                while w < 3 {
+                    let ws = unwrap_seat(w)
+                    let cur_w = pos.get(ws).to_u8()
+                    let exp_adv = if cur_w >= FINISH { FINISH } else { cur_w + 1 }
+
+                    match apply_move(pos, ws, Move::Advance) {
+                        Result::Err(_) => assert!(false),
+                        Result::Ok(np) => {
+                            assert!(np.get(ws).to_u8() == exp_adv)
+                            // Non-winner positions unchanged
+                            var other: u8 = 0
+                            while other < 3 {
+                                if other != w {
+                                    let os = unwrap_seat(other)
+                                    assert!(np.get(os).eq(pos.get(os)))
+                                }
+                                other = other + 1
+                            }
+                        },
+                    }
+
+                    // Test Push(target) for target in 0..=2
+                    var t: u8 = 0
+                    while t < 3 {
+                        let ts = unwrap_seat(t)
+                        let res = apply_move(pos, ws, Move::Push { target: ts })
+                        if t == w {
+                            match res {
+                                Result::Err(e) => assert!(e.eq(StepError::InvalidMove)),
+                                Result::Ok(_) => assert!(false),
+                            }
+                        } else {
+                            let cur_t = pos.get(ts).to_u8()
+                            let exp_push = if cur_t <= PUSH { 0 } else { cur_t - PUSH }
+                            match res {
+                                Result::Err(_) => assert!(false),
+                                Result::Ok(np) => {
+                                    assert!(np.get(ts).to_u8() == exp_push)
+                                    assert!(np.get(ws).eq(pos.get(ws)))
+                                },
+                            }
+                        }
+                        t = t + 1
+                    }
+                    w = w + 1
+                }
+
+                p2 = p2 + 1
+            }
+            p1 = p1 + 1
+        }
+        p0 = p0 + 1
+    }
+}
+
+// ============================================================================
+// T2.4 — Foundry `cast` hash vectors & Property P11 (commitment binding)
+// ============================================================================
+#[test]
+fn test_p11_commitment_vectors_and_binding() {
+    // Sentinel 0 is rejected by CommitmentHash::from_word
+    assert!(
+        match CommitmentHash::from_word(0) {
+            Option::None => true,
+            Option::Some(_) => false,
+        },
+    )
+    assert!(
+        !verify_commit(
+            stored: CommitmentHash::zero(),
+            domain_tag: DOMAIN_TAG,
+            context: 0x1234,
+            session_id: 1,
+            round: 1,
+            participant: 0,
+            choice: 2,
+            nonce: 99,
+        ),
+    )
+
+    // Vector 0 from Foundry `cast keccak`
+    let nonce0: u256 = 0xdeadbeefcafebabe0123456789abcdef0123456789abcdefdeadbeefcafebabe
+    let expected0: u256 = 0x2e36c50cb20de8ab24b2220e3f043bdd6aa0db9ff6943d6b436cdbf29135e398
+    let h0 = commitment(
+        table: 0x1234,
+        game_id: 1,
+        round: 1,
+        seat: Seat::s0(),
+        colour: Colour::Green,
+        nonce: nonce0,
+    )
+    assert!(h0 == expected0)
+
+    // Vector 1 from Foundry `cast keccak`
+    let expected1: u256 = 0x1b4d0fe1757c61e3bebb8d4106b682eff562b2a2bd3576bcdd4b0fbf5008c3a3
+    let h1 = commitment(
+        table: 0x9999,
+        game_id: 7,
+        round: 3,
+        seat: Seat::s2(),
+        colour: Colour::Blue,
+        nonce: 0x424242,
+    )
+    assert!(h1 == expected1)
+
+    // Property P11: flipping any single parameter produces a different commitment
+    assert!(
+        commitment(
+                table: 0x1235,
+                game_id: 1,
+                round: 1,
+                seat: Seat::s0(),
+                colour: Colour::Green,
+                nonce: nonce0,
+            )
+            != h0,
+    )
+    assert!(
+        commitment(
+                table: 0x1234,
+                game_id: 2,
+                round: 1,
+                seat: Seat::s0(),
+                colour: Colour::Green,
+                nonce: nonce0,
+            )
+            != h0,
+    )
+    assert!(
+        commitment(
+                table: 0x1234,
+                game_id: 1,
+                round: 2,
+                seat: Seat::s0(),
+                colour: Colour::Green,
+                nonce: nonce0,
+            )
+            != h0,
+    )
+    assert!(
+        commitment(
+                table: 0x1234,
+                game_id: 1,
+                round: 1,
+                seat: Seat::s1(),
+                colour: Colour::Green,
+                nonce: nonce0,
+            )
+            != h0,
+    )
+    assert!(
+        commitment(
+                table: 0x1234,
+                game_id: 1,
+                round: 1,
+                seat: Seat::s0(),
+                colour: Colour::Red,
+                nonce: nonce0,
+            )
+            != h0,
+    )
+    assert!(
+        commitment(
+                table: 0x1234,
+                game_id: 1,
+                round: 1,
+                seat: Seat::s0(),
+                colour: Colour::Green,
+                nonce: nonce0 + 1,
+            )
+            != h0,
+    )
+}
+
+// ============================================================================
+// T2.5 — Exhaustive Settlement Verification (P1, P2, P3, P4, P5, P13)
+// ============================================================================
+#[test]
+fn test_p1_to_p5_and_p13_settlement_exhaustive() {
+    let stakes: [u256; 5] = [0, 1, 2, 3, 1001]
+    for s in stakes {
+        // 1. Won(w)
+        var w: u8 = 0
+        while w < 3 {
+            let pay = settle(GameResult::Won { winner: unwrap_seat(w) }, s)
+            assert!(pay[0] + pay[1] + pay[2] == s * 3) // P2 conservation
+            assert!(pay[w as usize] == s * 3)
+            w = w + 1
+        }
+
+        // 2. CapReached(None) and CapReached(Some(l))
+        let draw_pay = settle(GameResult::CapReached { leader: Option::None }, s)
+        assert!(draw_pay[0] == s && draw_pay[1] == s && draw_pay[2] == s)
+        var l: u8 = 0
+        while l < 3 {
+            let pay = settle(
+                GameResult::CapReached { leader: Option::Some(unwrap_seat(l)) },
+                s,
+            )
+            assert!(pay[0] + pay[1] + pay[2] == s * 3)
+            assert!(pay[l as usize] == s * 3)
+            l = l + 1
+        }
+
+        // 3. Cancelled(joined in 1..=3)
+        var j: u8 = 1
+        while j <= 3 {
+            let pay = settle(GameResult::Cancelled { joined: j }, s)
+            assert!(pay[0] + pay[1] + pay[2] == s * (j as u256))
+            j = j + 1
+        }
+
+        // 4. Forfeited(mask in 1..=7) -> P1, P2, P3, P4, P5, P13
+        var mask: u8 = 1
+        while mask <= 7 {
+            let pay = settle_forfeit(mask, s)
+            let pay_via_settle = settle(GameResult::Forfeited { mask }, s)
+            assert!(
+                pay[0] == pay_via_settle[0]
+                    && pay[1] == pay_via_settle[1]
+                    && pay[2] == pay_via_settle[2],
+            )
+
+            // P2 conservation
+            assert!(pay[0] + pay[1] + pay[2] == s * 3)
+
+            var f_count: u8 = 0
+            var seat_i: u8 = 0
+            while seat_i < 3 {
+                if (mask & (1 << seat_i)) != 0 {
+                    f_count = f_count + 1
+                }
+                seat_i = seat_i + 1
+            }
+
+            // P3 survivor safety & P4 forfeiter pays stake (when < 3 forfeit)
+            var idx: u8 = 0
+            while idx < 3 {
+                let is_forfeiter = (mask & (1 << idx)) != 0
+                if !is_forfeiter {
+                    assert!(pay[idx as usize] >= s) // P3: non-forfeiter net >= 0
+                } else if f_count < 3 {
+                    assert!(pay[idx as usize] == 0) // P4: forfeiter net == -stake
+                } else {
+                    assert!(pay[idx as usize] == s) // All 3 forfeit -> refund
+                }
+                idx = idx + 1
+            }
+
+            // P5: single-forfeiter survivor split is symmetric up to 1 wei odd-stake dust
+            if f_count == 1 {
+                let low_exp = s + (s - (s / 2))
+                let high_exp = s + (s / 2)
+                assert!(low_exp - high_exp <= 1)
+                if mask == 1 {
+                    assert!(pay[0] == 0 && pay[1] == low_exp && pay[2] == high_exp)
+                } else if mask == 2 {
+                    assert!(pay[0] == low_exp && pay[1] == 0 && pay[2] == high_exp)
+                } else {
+                    assert!(pay[0] == low_exp && pay[1] == high_exp && pay[2] == 0)
+                }
+            }
+
+            // P13: no coalition C (c_mask in 1..=7) that causes EVERY forfeit (mask subset of C) profits
+            var c_mask: u8 = 1
+            while c_mask <= 7 {
+                if (mask & c_mask) == mask {
+                    var c_pay: u256 = 0
+                    var c_dep: u256 = 0
+                    var member: u8 = 0
+                    while member < 3 {
+                        if (c_mask & (1 << member)) != 0 {
+                            c_pay = c_pay + pay[member as usize]
+                            c_dep = c_dep + s
+                        }
+                        member = member + 1
+                    }
+                    assert!(c_pay <= c_dep) // Coalition net <= 0
+                }
+                c_mask = c_mask + 1
+            }
+
+            mask = mask + 1
+        }
+    }
+}
+
+// ============================================================================
+// T2.6 — Canonical 15-word encoding & 16-word digest chain
+// ============================================================================
+#[test]
+fn test_canonical_encode_and_digest_injectivity() {
+    let st0 = GameState::new(1001)
+    let ctx = StepCtx { now: 1000, caller: 0xA1, table: 0x1234, stake_paid: 1001 }
+    let out1 = unwrap_step(step(st0, 0, Input::Join, ctx))
+
+    // Verify 15-word encoding after first Join
+    let w = encode_state(out1.state)
+    assert!(w[0] == 1) // game_id
+    assert!(w[1] == 1) // step_no
+    assert!(w[2] == 1) // phase tag = Registration
+    assert!(w[3] == 1000 + JOIN_WINDOW) // deadline = 4600
+    assert!(w[4] == 0) // round
+    assert!(w[5] == 0) // positions
+    assert!(w[6] == 0) // winner/result
+    assert!(w[7] == 0) // seat states
+    assert!(w[8] == 0 && w[9] == 0 && w[10] == 0) // commits
+    assert!(w[11] == 0xA1 && w[12] == 0 && w[13] == 0) // players
+    assert!(w[14] == 1) // joined
+
+    // Matches Foundry `cast keccak` 16-word vector DIGEST_JOIN_1
+    let expected_digest: u256 = 0x1408f305575d8ccfef6aa8d564ac37c4fbc7087ffd7efb9c4cb016fff2d6b657
+    assert!(out1.digest == expected_digest)
+
+    // Injectivity: mutating any field changes digest_next
+    let base_d = out1.digest
+    var s_gid = out1.state
+    s_gid.game_id = 2
+    assert!(digest_next(0, s_gid) != base_d)
+
+    var s_step = out1.state
+    s_step.step_no = 2
+    assert!(digest_next(0, s_step) != base_d)
+
+    var s_pos = out1.state
+    s_pos.positions = Positions { p0: unwrap_pos(1), p1: Position::zero(), p2: Position::zero() }
+    assert!(digest_next(0, s_pos) != base_d)
+}
+
+// ============================================================================
+// T2.7 — Exhaustive (Phase × Input) error matrix (all 14 errors) & full games
+// ============================================================================
+#[test]
+fn test_p12_phase_input_matrix_and_all_14_errors() {
+    let table: u256 = 0x1234
+    let stake: u256 = 1001
+    let st0 = GameState::new(stake)
+
+    // --- IDLE phase ---
+    // Error 1: WrongPhase on Commit/Reveal/Move/Poke in Idle
+    let ctx_a = StepCtx { now: 100, caller: 0xA1, table, stake_paid: stake }
+    assert_step_err(
+        step(st0, 0, Input::Commit { hash: 1 }, ctx_a),
+        StepError::WrongPhase,
+    )
+    assert_step_err(
+        step(st0, 0, Input::Reveal { colour_raw: 0, nonce: 1 }, ctx_a),
+        StepError::WrongPhase,
+    )
+    assert_step_err(
+        step(st0, 0, Input::MoveInput { mv: Move::Advance }, ctx_a),
+        StepError::WrongPhase,
+    )
+    assert_step_err(step(st0, 0, Input::Poke, ctx_a), StepError::WrongPhase)
+
+    // Error 6: WrongStake on Join
+    let ctx_bad_stake = StepCtx { now: 100, caller: 0xA1, table, stake_paid: stake - 1 }
+    assert_step_err(
+        step(st0, 0, Input::Join, ctx_bad_stake),
+        StepError::WrongStake,
+    )
+
+    // Valid Join 1 -> Registration(deadline = 3700)
+    let out1 = unwrap_step(step(st0, 0, Input::Join, ctx_a))
+    let st1 = out1.state
+    let d1 = out1.digest
+
+    // --- REGISTRATION phase ---
+    assert_step_err(
+        step(st1, d1, Input::Commit { hash: 1 }, ctx_a),
+        StepError::WrongPhase,
+    )
+    // Error 5: DuplicatePlayer
+    assert_step_err(
+        step(st1, d1, Input::Join, ctx_a),
+        StepError::DuplicatePlayer,
+    )
+    // Error 8: DeadlineNotPassed on Poke at exact deadline (now == 3700)
+    let ctx_reg_exact = StepCtx { now: 100 + JOIN_WINDOW, caller: 0xB2, table, stake_paid: stake }
+    assert_step_err(
+        step(st1, d1, Input::Poke, ctx_reg_exact),
+        StepError::DeadlineNotPassed,
+    )
+    // Error 7: DeadlinePassed on Join after deadline (now == 3701)
+    let ctx_reg_late = StepCtx {
+        now: 100 + JOIN_WINDOW + 1,
+        caller: 0xB2,
+        table,
+        stake_paid: stake,
+    }
+    assert_step_err(
+        step(st1, d1, Input::Join, ctx_reg_late),
+        StepError::DeadlinePassed,
+    )
+
+    // Valid Join 2 at exact deadline (now == 3700) & Join 3 -> Commit(round=1, deadline = 3700 + 600 = 4300)
+    let out2 = unwrap_step(step(st1, d1, Input::Join, ctx_reg_exact))
+    let ctx_c = StepCtx { now: 3700, caller: 0xC3, table, stake_paid: stake }
+    let out3 = unwrap_step(step(out2.state, out2.digest, Input::Join, ctx_c))
+    let st_commit = out3.state
+    let d_commit = out3.digest
+
+    // --- COMMIT phase (round 1, deadline 4300) ---
+    assert_step_err(
+        step(st_commit, d_commit, Input::Join, ctx_a),
+        StepError::WrongPhase,
+    )
+    // Error 3: NotAPlayer
+    let ctx_outsider = StepCtx { now: 3800, caller: 0xDEAD, table, stake_paid: 0 }
+    assert_step_err(
+        step(
+            st_commit,
+            d_commit,
+            Input::Commit { hash: 123 },
+            ctx_outsider,
+        ),
+        StepError::NotAPlayer,
+    )
+    // Error 11: InvalidCommitment (hash == 0)
+    let ctx_a_commit = StepCtx { now: 3800, caller: 0xA1, table, stake_paid: 0 }
+    assert_step_err(
+        step(
+            st_commit,
+            d_commit,
+            Input::Commit { hash: 0 },
+            ctx_a_commit,
+        ),
+        StepError::InvalidCommitment,
+    )
+    // Error 7: DeadlinePassed on Commit at 4301
+    let ctx_a_late = StepCtx { now: 4301, caller: 0xA1, table, stake_paid: 0 }
+    assert_step_err(
+        step(
+            st_commit,
+            d_commit,
+            Input::Commit { hash: 123 },
+            ctx_a_late,
+        ),
+        StepError::DeadlinePassed,
+    )
+    // Error 8: DeadlineNotPassed on Poke at 4300
+    let ctx_poke_4300 = StepCtx { now: 4300, caller: 0xDEAD, table, stake_paid: 0 }
+    assert_step_err(
+        step(st_commit, d_commit, Input::Poke, ctx_poke_4300),
+        StepError::DeadlineNotPassed,
+    )
+
+    // S0 commits Red(0), S1 commits Red(0), S2 commits Blue(1) -> S2 wins Round 1!
+    let h_s0 = commitment(
+        table,
+        game_id: 1,
+        round: 1,
+        seat: Seat::s0(),
+        colour: Colour::Red,
+        nonce: 101,
+    )
+    let h_s1 = commitment(
+        table,
+        game_id: 1,
+        round: 1,
+        seat: Seat::s1(),
+        colour: Colour::Red,
+        nonce: 102,
+    )
+    let h_s2 = commitment(
+        table,
+        game_id: 1,
+        round: 1,
+        seat: Seat::s2(),
+        colour: Colour::Blue,
+        nonce: 103,
+    )
+
+    let out_c0 = unwrap_step(
+        step(
+            st_commit,
+            d_commit,
+            Input::Commit { hash: h_s0 },
+            ctx_a_commit,
+        ),
+    )
+    // Error 9: AlreadyCommitted
+    assert_step_err(
+        step(
+            out_c0.state,
+            out_c0.digest,
+            Input::Commit { hash: h_s0 },
+            ctx_a_commit,
+        ),
+        StepError::AlreadyCommitted,
+    )
+
+    let ctx_b_commit = StepCtx { now: 3800, caller: 0xB2, table, stake_paid: 0 }
+    let out_c1 = unwrap_step(
+        step(
+            out_c0.state,
+            out_c0.digest,
+            Input::Commit { hash: h_s1 },
+            ctx_b_commit,
+        ),
+    )
+    let ctx_c_commit = StepCtx { now: 3800, caller: 0xC3, table, stake_paid: 0 }
+    let out_c2 = unwrap_step(
+        step(
+            out_c1.state,
+            out_c1.digest,
+            Input::Commit { hash: h_s2 },
+            ctx_c_commit,
+        ),
+    )
+    let st_rev = out_c2.state
+    let d_rev = out_c2.digest
+
+    // --- REVEAL phase (round 1, deadline = 3800 + 600 = 4400) ---
+    assert_step_err(
+        step(st_rev, d_rev, Input::Commit { hash: 1 }, ctx_a_commit),
+        StepError::WrongPhase,
+    )
+    // Error 3: NotAPlayer
+    assert_step_err(
+        step(
+            st_rev,
+            d_rev,
+            Input::Reveal { colour_raw: 0, nonce: 101 },
+            ctx_outsider,
+        ),
+        StepError::NotAPlayer,
+    )
+    // Error 7: DeadlinePassed at 4401
+    let ctx_rev_late = StepCtx { now: 4401, caller: 0xA1, table, stake_paid: 0 }
+    assert_step_err(
+        step(
+            st_rev,
+            d_rev,
+            Input::Reveal { colour_raw: 0, nonce: 101 },
+            ctx_rev_late,
+        ),
+        StepError::DeadlinePassed,
+    )
+    // Error 12: InvalidColour (colour_raw = 3)
+    assert_step_err(
+        step(
+            st_rev,
+            d_rev,
+            Input::Reveal { colour_raw: 3, nonce: 101 },
+            ctx_a_commit,
+        ),
+        StepError::InvalidColour,
+    )
+    // Error 13: BadReveal (wrong nonce)
+    assert_step_err(
+        step(
+            st_rev,
+            d_rev,
+            Input::Reveal { colour_raw: 0, nonce: 999 },
+            ctx_a_commit,
+        ),
+        StepError::BadReveal,
+    )
+
+    // S0 reveals Red
+    let out_r0 = unwrap_step(
+        step(
+            st_rev,
+            d_rev,
+            Input::Reveal { colour_raw: 0, nonce: 101 },
+            ctx_a_commit,
+        ),
+    )
+    // Error 10: AlreadyRevealed
+    assert_step_err(
+        step(
+            out_r0.state,
+            out_r0.digest,
+            Input::Reveal { colour_raw: 0, nonce: 101 },
+            ctx_a_commit,
+        ),
+        StepError::AlreadyRevealed,
+    )
+    // S1 and S2 reveal -> WinnerMove(round=1, winner=S2, deadline = 3800 + 600 = 4400)
+    let out_r1 = unwrap_step(
+        step(
+            out_r0.state,
+            out_r0.digest,
+            Input::Reveal { colour_raw: 0, nonce: 102 },
+            ctx_b_commit,
+        ),
+    )
+    let out_r2 = unwrap_step(
+        step(
+            out_r1.state,
+            out_r1.digest,
+            Input::Reveal { colour_raw: 1, nonce: 103 },
+            ctx_c_commit,
+        ),
+    )
+    let st_mv = out_r2.state
+    let d_mv = out_r2.digest
+
+    // --- WINNER_MOVE phase (winner = S2, deadline = 4400) ---
+    assert_step_err(
+        step(st_mv, d_mv, Input::Join, ctx_c_commit),
+        StepError::WrongPhase,
+    )
+    // Error 3: NotAPlayer
+    assert_step_err(
+        step(
+            st_mv,
+            d_mv,
+            Input::MoveInput { mv: Move::Advance },
+            ctx_outsider,
+        ),
+        StepError::NotAPlayer,
+    )
+    // Error 4: NotYourMove (S0 tries to move when S2 won)
+    assert_step_err(
+        step(
+            st_mv,
+            d_mv,
+            Input::MoveInput { mv: Move::Advance },
+            ctx_a_commit,
+        ),
+        StepError::NotYourMove,
+    )
+    // Error 14: InvalidMove (S2 tries to Push(S2))
+    assert_step_err(
+        step(
+            st_mv,
+            d_mv,
+            Input::MoveInput { mv: Move::Push { target: Seat::s2() } },
+            ctx_c_commit,
+        ),
+        StepError::InvalidMove,
+    )
+    // Error 7: DeadlinePassed on MoveInput at 4401
+    let ctx_c_late = StepCtx { now: 4401, caller: 0xC3, table, stake_paid: 0 }
+    assert_step_err(
+        step(
+            st_mv,
+            d_mv,
+            Input::MoveInput { mv: Move::Advance },
+            ctx_c_late,
+        ),
+        StepError::DeadlinePassed,
+    )
+
+    // Test timeout Poke in Commit phase -> Finished(Forfeited) -> Error 2: GameFinished
+    let out_mv = unwrap_step(
+        step(
+            st_mv,
+            d_mv,
+            Input::MoveInput { mv: Move::Advance },
+            ctx_c_commit,
+        ),
+    )
+    assert!(out_mv.state.positions.p2.to_u8() == 1)
+    assert!(out_mv.state.round == 2)
+
+    // In Round 2 Commit (deadline = 3800 + 600 = 4400), Poke at 4401 forfeits all 3 (mask = 7)
+    let ctx_poke_late = StepCtx { now: 4401, caller: 0xDEAD, table, stake_paid: 0 }
+    let out_fin = unwrap_step(
+        step(out_mv.state, out_mv.digest, Input::Poke, ctx_poke_late),
+    )
+    assert!(out_fin.finished)
+    assert!(
+        out_fin.payouts[0] == stake && out_fin.payouts[1] == stake && out_fin.payouts[2] == stake,
+    )
+
+    // Error 2: GameFinished on any non-Join input in Finished phase
+    assert_step_err(
+        step(out_fin.state, out_fin.digest, Input::Poke, ctx_poke_late),
+        StepError::GameFinished,
+    )
+
+    // Starting Game #2 from Finished works and increments game_id to 2
+    let out_g2 = unwrap_step(step(out_fin.state, out_fin.digest, Input::Join, ctx_a))
+    assert!(out_g2.state.game_id == 2)
+    assert!(out_g2.state.step_no == 1)
+}
