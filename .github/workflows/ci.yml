@@ -8,8 +8,8 @@ permissions:
   contents: read
 
 env:
-  # Any Fe release from 26.5.0 on is allowed for the contest.
-  FE_VERSION: v26.5.0
+  # Pin Fe 26.6.0 (native Keccak requires >= 26.6.0).
+  FE_VERSION: v26.6.0
 
 jobs:
   test:
@@ -21,6 +21,21 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version "$FE_VERSION" --no-modify-path
           echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
       - run: fe --version
-      - run: fe fmt --check
-      - run: fe test
-      - run: fe build
+      - run: fe fmt --check ingots
+      - run: fe check
+      - run: fe check ingots/outlier_core --backend native
+      - run: fe check ingots/testkit --backend native
+      - run: fe check ingots/outlier_cli --backend native
+      - run: fe test -i outlier_core
+      - run: fe test -i outlier_core --backend native
+      - run: fe test -i outlier_table
+      - run: fe test -i testkit
+      - run: fe test -i testkit --backend native
+      - run: fe test -i outlier_cli --backend native
+      - run: fe build -i outlier_table --emit sizes,bytecode,abi --out-dir out
+      - run: fe build -i outlier_cli --backend native --emit executable --out-dir out
+      - run: ./scripts/check_compile_fail.sh
+      - run: python3 oracle/outlier_model.py --finish 2 --cap 3 --stake 3
+      - run: ./out/outlier_cli vectors
+      - run: ./out/outlier_cli replay demo/game1.log
+      - run: ./out/outlier_cli replay demo/game2_forfeit.log
