@@ -1,1 +1,17 @@
 out/
+target/
+scratch/
+extras/
+.fe-lsp*
+__pycache__/
+*.pyc
+AGENTS.md
+docs/AI_LOG.md
+docs/PLAN.md
+docs/RUBRIC_MAP.md
+docs/REDTEAM_FINDINGS.md
+docs/RISKS.md
+docs/DECISIONS.md
+docs/FE_VERIFIED.md
+docs/CLAIMS.md
+docs/TEST_STRATEGY.md

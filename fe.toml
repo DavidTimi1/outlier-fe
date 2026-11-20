@@ -1,3 +1,5 @@
-[ingot]
-name = "starter"
+[workspace]
+name = "outlier"
 version = "0.1.0"
+members = ["ingots/*"]
+exclude = ["target", "out", "scratch"]
