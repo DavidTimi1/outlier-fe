@@ -1,0 +1,364 @@
+// Thin EVM contract adapter for OUTLIER (`docs/ARCHITECTURE.md §4`).
+//
+// Hard constraint H2: Zero game rules, phase branches, or deadline checks live in this file.
+// Every transition handler delegates to `execute_transition`, which loads `state`, builds
+// `StepCtx`, calls `outlier_core::step`, writes `out.state` and `out.digest`, credits
+// pull-payment `owed` if `out.finished`, and emits events — or reverts with the typed
+// 4-byte custom error.
+
+use outlier_core::{
+    GameState,
+    Input,
+    InputEvent,
+    Move,
+    StepCtx,
+    StepError,
+    StepOut,
+    encode_state,
+    make_move_input,
+    step,
+}
+use std::evm::{StorageMap, wei}
+use std::evm::effects::revert_error
+
+// ============================================================================
+// Typed Solidity-compatible custom errors (docs/SPEC.md §9)
+// ============================================================================
+#[error]
+pub struct WrongPhase {}
+
+#[error]
+pub struct GameFinished {}
+
+#[error]
+pub struct NotAPlayer {}
+
+#[error]
+pub struct NotYourMove {}
+
+#[error]
+pub struct DuplicatePlayer {}
+
+#[error]
+pub struct WrongStake {}
+
+#[error]
+pub struct DeadlinePassed {}
+
+#[error]
+pub struct DeadlineNotPassed {}
+
+#[error]
+pub struct AlreadyCommitted {}
+
+#[error]
+pub struct AlreadyRevealed {}
+
+#[error]
+pub struct InvalidCommitment {}
+
+#[error]
+pub struct InvalidColour {}
+
+#[error]
+pub struct BadReveal {}
+
+#[error]
+pub struct InvalidMove {}
+
+#[error]
+pub struct NothingToWithdraw {}
+
+#[error]
+pub struct TransferFailed {}
+
+#[inline(never)]
+fn revert_step_error(_ err: StepError) -> ! {
+    match err {
+        StepError::WrongPhase => revert_error(WrongPhase {}),
+        StepError::GameFinished => revert_error(GameFinished {}),
+        StepError::NotAPlayer => revert_error(NotAPlayer {}),
+        StepError::NotYourMove => revert_error(NotYourMove {}),
+        StepError::DuplicatePlayer => revert_error(DuplicatePlayer {}),
+        StepError::WrongStake => revert_error(WrongStake {}),
+        StepError::DeadlinePassed => revert_error(DeadlinePassed {}),
+        StepError::DeadlineNotPassed => revert_error(DeadlineNotPassed {}),
+        StepError::AlreadyCommitted => revert_error(AlreadyCommitted {}),
+        StepError::AlreadyRevealed => revert_error(AlreadyRevealed {}),
+        StepError::InvalidCommitment => revert_error(InvalidCommitment {}),
+        StepError::InvalidColour => revert_error(InvalidColour {}),
+        StepError::BadReveal => revert_error(BadReveal {}),
+        StepError::InvalidMove => revert_error(InvalidMove {}),
+    }
+}
+
+// ============================================================================
+// Events (docs/SPEC.md §8)
+// ============================================================================
+#[event]
+pub struct Joined {
+    #[indexed]
+    pub game_id: u256,
+    #[indexed]
+    pub caller: Address,
+    pub seat: u8,
+}
+
+#[event]
+pub struct Committed {
+    #[indexed]
+    pub game_id: u256,
+    pub seat: u8,
+    pub hash: u256,
+}
+
+#[event]
+pub struct Revealed {
+    #[indexed]
+    pub game_id: u256,
+    pub seat: u8,
+    pub colour: u8,
+    pub nonce: u256,
+}
+
+#[event]
+pub struct MoveMade {
+    #[indexed]
+    pub game_id: u256,
+    pub seat: u8,
+    pub kind: u8,
+    pub target: u8,
+}
+
+#[event]
+pub struct MoveDefaulted {
+    #[indexed]
+    pub game_id: u256,
+    pub seat: u8,
+}
+
+#[event]
+pub struct Poked {
+    #[indexed]
+    pub game_id: u256,
+    pub caller: Address,
+}
+
+#[event]
+pub struct Transition {
+    #[indexed]
+    pub game_id: u256,
+    pub step_no: u256,
+    pub ts: u256,
+    pub digest: u256,
+}
+
+#[event]
+pub struct Withdrawn {
+    #[indexed]
+    pub player: Address,
+    pub to: Address,
+    pub amount: Wei,
+}
+
+#[inline(never)]
+fn emit_step_events(_ out: StepOut, _ ts: u256) uses (log: mut Log) {
+    let gid = out.state.game_id
+    match out.input_event {
+        InputEvent::Joined { caller, seat } => {
+            log.emit(
+                Joined { game_id: gid, caller: Address::new(caller), seat: seat.to_u8() },
+            )
+        },
+        InputEvent::Committed { seat, hash } => {
+            log.emit(Committed { game_id: gid, seat: seat.to_u8(), hash })
+        },
+        InputEvent::Revealed { seat, colour, nonce } => {
+            log.emit(
+                Revealed { game_id: gid, seat: seat.to_u8(), colour: colour.to_u8(), nonce },
+            )
+        },
+        InputEvent::MoveMade { seat, mv } => match mv {
+            Move::Advance => {
+                log.emit(
+                    MoveMade { game_id: gid, seat: seat.to_u8(), kind: 0, target: 0 },
+                )
+            },
+            Move::Push { target } => {
+                log.emit(
+                    MoveMade { game_id: gid, seat: seat.to_u8(), kind: 1, target: target.to_u8() },
+                )
+            },
+        },
+        InputEvent::MoveDefaulted { seat } => {
+            log.emit(MoveDefaulted { game_id: gid, seat: seat.to_u8() })
+        },
+        InputEvent::Poked { caller } => {
+            log.emit(Poked { game_id: gid, caller: Address::new(caller) })
+        },
+    }
+    log.emit(
+        Transition { game_id: gid, step_no: out.state.step_no, ts, digest: out.digest },
+    )
+}
+
+#[inline(never)]
+fn credit_payouts(_ out: StepOut) uses (owed: mut StorageMap<Address, Wei>) {
+    if out.finished {
+        var i: usize = 0
+        while i < 3 {
+            let p_word = out.state.players[i]
+            let amt = out.payouts[i]
+            if p_word != 0 && amt > 0 {
+                let addr = Address::new(p_word)
+                owed.set(key: addr, value: owed.get(key: addr) + wei(amt))
+            }
+            i = i + 1
+        }
+    }
+}
+
+#[inline(never)]
+fn execute_transition(_ input: Input, _ stake_paid: u256)
+uses (
+    ctx: Ctx,
+    state: mut GameState,
+    digest: mut u256,
+    owed: mut StorageMap<Address, Wei>,
+    log: mut Log,
+)
+{
+    let now = ctx.timestamp().as_seconds()
+    let sctx = StepCtx { now, caller: ctx.caller().word(), table: ctx.address().word(), stake_paid }
+    match step(state, digest, input, sctx) {
+        Result::Err(e) => revert_step_error(e),
+        Result::Ok(out) => {
+            state = out.state
+            digest = out.digest
+            credit_payouts(out)
+            emit_step_events(out, now)
+        },
+    }
+}
+
+// ============================================================================
+// Message Interface (`docs/ARCHITECTURE.md §6`)
+// ============================================================================
+pub msg TableMsg {
+    #[selector = sol("join()")]
+    Join,
+    #[selector = sol("commit(uint256)")]
+    Commit { hash: u256 },
+    #[selector = sol("reveal(uint8,uint256)")]
+    Reveal { colour_raw: u8, nonce: u256 },
+    #[selector = sol("makeMove(uint8,uint8)")]
+    MakeMove { kind: u8, target: u8 },
+    #[selector = sol("poke()")]
+    Poke,
+    #[selector = sol("withdraw(address)")]
+    Withdraw { to: Address } -> Wei,
+    #[selector = sol("digest()")]
+    GetDigest -> u256,
+    #[selector = sol("gameId()")]
+    GetGameId -> u256,
+    #[selector = sol("stepNo()")]
+    GetStepNo -> u256,
+    #[selector = sol("phaseTag()")]
+    GetPhaseTag -> u8,
+    #[selector = sol("round()")]
+    GetRound -> u8,
+    #[selector = sol("positionsPacked()")]
+    GetPositionsPacked -> u256,
+    #[selector = sol("owed(address)")]
+    GetOwed { player: Address } -> Wei,
+    #[selector = sol("stateWord(uint8)")]
+    GetStateWord { index: u8 } -> u256,
+}
+
+// ============================================================================
+// Contract Adapter (`OutlierTable`)
+// ============================================================================
+pub contract OutlierTable uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    mut state: GameState,
+    mut digest: u256,
+    mut owed: StorageMap<Address, Wei>,
+
+    init(stake_amount: Wei)
+    uses (mut state, mut digest)
+    {
+        state = GameState::new(stake_amount.as_wei())
+        digest = 0
+    }
+
+    recv TableMsg {
+        #[payable]
+        Join uses (ctx, mut state, mut digest, mut owed, mut log) {
+            execute_transition(Input::Join, ctx.value().as_wei())
+        }
+
+        Commit { hash } uses (ctx, mut state, mut digest, mut owed, mut log) {
+            execute_transition(Input::Commit { hash }, 0)
+        }
+
+        Reveal { colour_raw, nonce } uses (ctx, mut state, mut digest, mut owed, mut log) {
+            execute_transition(Input::Reveal { colour_raw, nonce }, 0)
+        }
+
+        MakeMove { kind, target } uses (ctx, mut state, mut digest, mut owed, mut log) {
+            let inp = make_move_input(state.phase, kind, target)
+            execute_transition(inp, 0)
+        }
+
+        Poke uses (ctx, mut state, mut digest, mut owed, mut log) {
+            execute_transition(Input::Poke, 0)
+        }
+
+        Withdraw { to } -> Wei uses (ctx, mut call, mut owed, mut log) {
+            let player = ctx.caller()
+            let amount = owed.get(key: player)
+            if amount == Wei::zero() {
+                revert_error(NothingToWithdraw {})
+            }
+            // Checks-Effects-Interactions: zero `owed` BEFORE external `send_value` call
+            owed.set(key: player, value: Wei::zero())
+            if !call.send_value(addr: to, gas: 0, value: amount).success() {
+                revert_error(TransferFailed {})
+            }
+            log.emit(Withdrawn { player, to, amount })
+            amount
+        }
+
+        GetDigest -> u256 uses (digest) {
+            digest
+        }
+
+        GetGameId -> u256 uses (state) {
+            state.game_id
+        }
+
+        GetStepNo -> u256 uses (state) {
+            state.step_no
+        }
+
+        GetPhaseTag -> u8 uses (state) {
+            state.phase.tag()
+        }
+
+        GetRound -> u8 uses (state) {
+            state.round
+        }
+
+        GetPositionsPacked -> u256 uses (state) {
+            state.positions.packed()
+        }
+
+        GetOwed { player } -> Wei uses (owed) {
+            owed.get(key: player)
+        }
+
+        GetStateWord { index } -> u256 uses (state) {
+            let w = encode_state(state)
+            if index < 15 { w[index as usize] } else { 0 }
+        }
+    }
+}

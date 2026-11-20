@@ -1,0 +1,688 @@
+// Comprehensive EVM contract tests for `OutlierTable` (T3.3, T3.5).
+// Uses `PlayerProxy` to simulate 3 distinct player addresses + an outsider,
+// verifies exact 4-byte custom error selectors via `evm.try_call` + `is_error<E>`,
+// verifies state/digest immutability on revert, tests pull-payment `withdraw()`
+// and double-withdraw rejection, and asserts bit-for-bit digest parity between
+// `OutlierTable` (on-chain EVM) and `outlier_core::step` (pure state machine).
+
+use ingot::{
+    AlreadyCommitted,
+    AlreadyRevealed,
+    BadReveal,
+    DeadlineNotPassed,
+    DuplicatePlayer,
+    GameFinished,
+    InvalidColour,
+    InvalidCommitment,
+    InvalidMove,
+    NotAPlayer,
+    NotYourMove,
+    NothingToWithdraw,
+    OutlierTable,
+    TableMsg,
+    WrongPhase,
+    WrongStake,
+}
+use outlier_core::{
+    Colour,
+    GameState,
+    Input,
+    Move,
+    Seat,
+    StepCtx,
+    StepError,
+    StepOut,
+    commitment,
+    step,
+}
+use std::evm::returndata::is_error
+use std::evm::wei
+
+pub msg ProxyMsg {
+    #[selector = sol("join(address)")]
+    Join { table: Address },
+    #[selector = sol("commit(address,uint256)")]
+    Commit { table: Address, hash: u256 },
+    #[selector = sol("reveal(address,uint8,uint256)")]
+    Reveal { table: Address, colour_raw: u8, nonce: u256 },
+    #[selector = sol("makeMove(address,uint8,uint8)")]
+    MakeMove { table: Address, kind: u8, target: u8 },
+    #[selector = sol("poke(address)")]
+    Poke { table: Address },
+    #[selector = sol("withdraw(address,address)")]
+    Withdraw { table: Address, to: Address } -> Wei,
+}
+
+pub contract PlayerProxy uses (ctx: Ctx, call: mut Call) {
+    init() {}
+
+    recv ProxyMsg {
+        #[payable]
+        Join { table } uses (ctx, mut call) {
+            call.call(
+                addr: table,
+                gas: 800000,
+                value: ctx.value(),
+                message: TableMsg::Join {},
+            )
+        }
+
+        Commit { table, hash } uses (mut call) {
+            call.call(
+                addr: table,
+                gas: 800000,
+                value: Wei::zero(),
+                message: TableMsg::Commit { hash },
+            )
+        }
+
+        Reveal { table, colour_raw, nonce } uses (mut call) {
+            call.call(
+                addr: table,
+                gas: 800000,
+                value: Wei::zero(),
+                message: TableMsg::Reveal { colour_raw, nonce },
+            )
+        }
+
+        MakeMove { table, kind, target } uses (mut call) {
+            call.call(
+                addr: table,
+                gas: 800000,
+                value: Wei::zero(),
+                message: TableMsg::MakeMove { kind, target },
+            )
+        }
+
+        Poke { table } uses (mut call) {
+            call.call(
+                addr: table,
+                gas: 800000,
+                value: Wei::zero(),
+                message: TableMsg::Poke {},
+            )
+        }
+
+        Withdraw { table, to } -> Wei uses (mut call) {
+            call.call(
+                addr: table,
+                gas: 800000,
+                value: Wei::zero(),
+                message: TableMsg::Withdraw { to },
+            )
+        }
+    }
+}
+
+fn unwrap_pure(_ res: Result<StepError, StepOut>) -> StepOut {
+    match res {
+        Result::Ok(o) => o,
+        Result::Err(_) => {
+            assert!(false)
+            StepOut {
+                state: GameState::new(0),
+                input_event: outlier_core::InputEvent::Poked { caller: 0 },
+                digest: 0,
+                finished: false,
+                payouts: [0, 0, 0],
+            }
+        },
+    }
+}
+
+fn get_digest(_ table: Address) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: table,
+        gas: 200000,
+        value: Wei::zero(),
+        message: TableMsg::GetDigest {},
+    )
+}
+
+fn get_step_no(_ table: Address) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: table,
+        gas: 200000,
+        value: Wei::zero(),
+        message: TableMsg::GetStepNo {},
+    )
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn test_contract_errors_full_game_withdraw_and_parity() uses (evm: mut Evm) {
+    let stake_val: u256 = 1001
+    let stake: Wei = wei(stake_val)
+    let table = evm.create2<OutlierTable>(value: Wei::zero(), args: (stake,), salt: 0)
+    let p0 = evm.create2<PlayerProxy>(value: Wei::zero(), args: (), salt: 1)
+    let p1 = evm.create2<PlayerProxy>(value: Wei::zero(), args: (), salt: 2)
+    let p2 = evm.create2<PlayerProxy>(value: Wei::zero(), args: (), salt: 3)
+    let outsider = evm.create2<PlayerProxy>(value: Wei::zero(), args: (), salt: 4)
+    let now = evm.timestamp().as_seconds()
+
+    // Parallel pure state machine for bit-for-bit on-chain vs pure parity check
+    var pure_st = GameState::new(stake_val)
+    var pure_digest: u256 = 0
+
+    // 1. IDLE phase error checks (WrongPhase, WrongStake, NothingToWithdraw)
+    let err_idle_commit = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Commit { table, hash: 123 },
+        )
+    assert!(
+        !err_idle_commit.success() && is_error<WrongPhase>(err_idle_commit.returndata()),
+    )
+    assert!(get_digest(table) == 0 && get_step_no(table) == 0)
+
+    let err_wrong_stake = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: wei(stake_val - 1),
+            message: ProxyMsg::Join { table },
+        )
+    assert!(
+        !err_wrong_stake.success() && is_error<WrongStake>(err_wrong_stake.returndata()),
+    )
+    assert!(get_digest(table) == 0)
+
+    let err_no_withdraw = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Withdraw { table, to: p0 },
+        )
+    assert!(
+        !err_no_withdraw.success() && is_error<NothingToWithdraw>(err_no_withdraw.returndata()),
+    )
+
+    // 2. REGISTRATION phase: p0 joins, DuplicatePlayer & DeadlineNotPassed checks, then p1 & p2 join
+    evm.call(
+        addr: p0,
+        gas: 1000000,
+        value: stake,
+        message: ProxyMsg::Join { table },
+    )
+    let o1 = unwrap_pure(
+        step(
+            pure_st,
+            pure_digest,
+            Input::Join,
+            StepCtx { now, caller: p0.word(), table: table.word(), stake_paid: stake_val },
+        ),
+    )
+    pure_st = o1.state
+    pure_digest = o1.digest
+    assert!(get_digest(table) == pure_digest)
+
+    let d_before = get_digest(table)
+    let err_dup = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: stake,
+            message: ProxyMsg::Join { table },
+        )
+    assert!(
+        !err_dup.success() && is_error<DuplicatePlayer>(err_dup.returndata()),
+    )
+    assert!(get_digest(table) == d_before)
+
+    let err_poke_early = evm
+        .try_call(
+            addr: outsider,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Poke { table },
+        )
+    assert!(
+        !err_poke_early.success() && is_error<DeadlineNotPassed>(err_poke_early.returndata()),
+    )
+    assert!(get_digest(table) == d_before)
+
+    evm.call(
+        addr: p1,
+        gas: 1000000,
+        value: stake,
+        message: ProxyMsg::Join { table },
+    )
+    let o2 = unwrap_pure(
+        step(
+            pure_st,
+            pure_digest,
+            Input::Join,
+            StepCtx { now, caller: p1.word(), table: table.word(), stake_paid: stake_val },
+        ),
+    )
+    pure_st = o2.state
+    pure_digest = o2.digest
+
+    evm.call(
+        addr: p2,
+        gas: 1000000,
+        value: stake,
+        message: ProxyMsg::Join { table },
+    )
+    let o3 = unwrap_pure(
+        step(
+            pure_st,
+            pure_digest,
+            Input::Join,
+            StepCtx { now, caller: p2.word(), table: table.word(), stake_paid: stake_val },
+        ),
+    )
+    pure_st = o3.state
+    pure_digest = o3.digest
+    assert!(get_digest(table) == pure_digest)
+
+    // 3. COMMIT phase (Round 1): NotAPlayer, InvalidCommitment, AlreadyCommitted
+    let err_not_player = evm
+        .try_call(
+            addr: outsider,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Commit { table, hash: 111 },
+        )
+    assert!(
+        !err_not_player.success() && is_error<NotAPlayer>(err_not_player.returndata()),
+    )
+
+    let err_zero_commit = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Commit { table, hash: 0 },
+        )
+    assert!(
+        !err_zero_commit.success() && is_error<InvalidCommitment>(err_zero_commit.returndata()),
+    )
+
+    // Round 1: All-distinct (Red=0, Blue=1, Green=2) -> NoWinner -> Round 2!
+    let h1_0 = commitment(
+        table: table.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s0(),
+        colour: Colour::Red,
+        nonce: 10,
+    )
+    let h1_1 = commitment(
+        table: table.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s1(),
+        colour: Colour::Blue,
+        nonce: 20,
+    )
+    let h1_2 = commitment(
+        table: table.word(),
+        game_id: 1,
+        round: 1,
+        seat: Seat::s2(),
+        colour: Colour::Green,
+        nonce: 30,
+    )
+
+    evm.call(
+        addr: p0,
+        gas: 1000000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table, hash: h1_0 },
+    )
+    let err_already_c = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Commit { table, hash: h1_0 },
+        )
+    assert!(
+        !err_already_c.success() && is_error<AlreadyCommitted>(err_already_c.returndata()),
+    )
+
+    evm.call(
+        addr: p1,
+        gas: 1000000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table, hash: h1_1 },
+    )
+    evm.call(
+        addr: p2,
+        gas: 1000000,
+        value: Wei::zero(),
+        message: ProxyMsg::Commit { table, hash: h1_2 },
+    )
+
+    let oc0 = unwrap_pure(
+        step(
+            pure_st,
+            pure_digest,
+            Input::Commit { hash: h1_0 },
+            StepCtx { now, caller: p0.word(), table: table.word(), stake_paid: 0 },
+        ),
+    )
+    let oc1 = unwrap_pure(
+        step(
+            oc0.state,
+            oc0.digest,
+            Input::Commit { hash: h1_1 },
+            StepCtx { now, caller: p1.word(), table: table.word(), stake_paid: 0 },
+        ),
+    )
+    let oc2 = unwrap_pure(
+        step(
+            oc1.state,
+            oc1.digest,
+            Input::Commit { hash: h1_2 },
+            StepCtx { now, caller: p2.word(), table: table.word(), stake_paid: 0 },
+        ),
+    )
+    pure_st = oc2.state
+    pure_digest = oc2.digest
+    assert!(get_digest(table) == pure_digest)
+
+    // 4. REVEAL phase (Round 1): InvalidColour, BadReveal, AlreadyRevealed
+    let err_bad_col = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Reveal { table, colour_raw: 3, nonce: 10 },
+        )
+    assert!(
+        !err_bad_col.success() && is_error<InvalidColour>(err_bad_col.returndata()),
+    )
+
+    let err_bad_rev = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Reveal { table, colour_raw: 0, nonce: 999 },
+        )
+    assert!(
+        !err_bad_rev.success() && is_error<BadReveal>(err_bad_rev.returndata()),
+    )
+
+    evm.call(
+        addr: p0,
+        gas: 1000000,
+        value: Wei::zero(),
+        message: ProxyMsg::Reveal { table, colour_raw: 0, nonce: 10 },
+    )
+    let err_already_r = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Reveal { table, colour_raw: 0, nonce: 10 },
+        )
+    assert!(
+        !err_already_r.success() && is_error<AlreadyRevealed>(err_already_r.returndata()),
+    )
+
+    evm.call(
+        addr: p1,
+        gas: 1000000,
+        value: Wei::zero(),
+        message: ProxyMsg::Reveal { table, colour_raw: 1, nonce: 20 },
+    )
+    evm.call(
+        addr: p2,
+        gas: 1000000,
+        value: Wei::zero(),
+        message: ProxyMsg::Reveal { table, colour_raw: 2, nonce: 30 },
+    )
+
+    let or0 = unwrap_pure(
+        step(
+            pure_st,
+            pure_digest,
+            Input::Reveal { colour_raw: 0, nonce: 10 },
+            StepCtx { now, caller: p0.word(), table: table.word(), stake_paid: 0 },
+        ),
+    )
+    let or1 = unwrap_pure(
+        step(
+            or0.state,
+            or0.digest,
+            Input::Reveal { colour_raw: 1, nonce: 20 },
+            StepCtx { now, caller: p1.word(), table: table.word(), stake_paid: 0 },
+        ),
+    )
+    let or2 = unwrap_pure(
+        step(
+            or1.state,
+            or1.digest,
+            Input::Reveal { colour_raw: 2, nonce: 30 },
+            StepCtx { now, caller: p2.word(), table: table.word(), stake_paid: 0 },
+        ),
+    )
+    pure_st = or2.state
+    pure_digest = or2.digest
+    assert!(get_digest(table) == pure_digest)
+
+    // 5. Play Rounds 2..=5 to victory for S0 (with NotYourMove & InvalidMove checks in Round 2)
+    var r: u8 = 2
+    while r <= 5 {
+        let h0 = commitment(
+            table: table.word(),
+            game_id: 1,
+            round: r as u256,
+            seat: Seat::s0(),
+            colour: Colour::Blue,
+            nonce: (r as u256) * 100 + 1,
+        )
+        let h1 = commitment(
+            table: table.word(),
+            game_id: 1,
+            round: r as u256,
+            seat: Seat::s1(),
+            colour: Colour::Red,
+            nonce: (r as u256) * 100 + 2,
+        )
+        let h2 = commitment(
+            table: table.word(),
+            game_id: 1,
+            round: r as u256,
+            seat: Seat::s2(),
+            colour: Colour::Red,
+            nonce: (r as u256) * 100 + 3,
+        )
+
+        evm.call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Commit { table, hash: h0 },
+        )
+        evm.call(
+            addr: p1,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Commit { table, hash: h1 },
+        )
+        evm.call(
+            addr: p2,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Commit { table, hash: h2 },
+        )
+
+        evm.call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Reveal { table, colour_raw: 1, nonce: (r as u256) * 100 + 1 },
+        )
+        evm.call(
+            addr: p1,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Reveal { table, colour_raw: 0, nonce: (r as u256) * 100 + 2 },
+        )
+        evm.call(
+            addr: p2,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Reveal { table, colour_raw: 0, nonce: (r as u256) * 100 + 3 },
+        )
+
+        if r == 2 {
+            // Test NotYourMove (p1 tries to move when p0 won) and InvalidMove (p0 pushes self, or bad kind=9)
+            let err_nym = evm
+                .try_call(
+                    addr: p1,
+                    gas: 1000000,
+                    value: Wei::zero(),
+                    message: ProxyMsg::MakeMove { table, kind: 0, target: 0 },
+                )
+            assert!(
+                !err_nym.success() && is_error<NotYourMove>(err_nym.returndata()),
+            )
+
+            let err_self_push = evm
+                .try_call(
+                    addr: p0,
+                    gas: 1000000,
+                    value: Wei::zero(),
+                    message: ProxyMsg::MakeMove { table, kind: 1, target: 0 },
+                )
+            assert!(
+                !err_self_push.success() && is_error<InvalidMove>(err_self_push.returndata()),
+            )
+
+            let err_bad_kind = evm
+                .try_call(
+                    addr: p0,
+                    gas: 1000000,
+                    value: Wei::zero(),
+                    message: ProxyMsg::MakeMove { table, kind: 9, target: 0 },
+                )
+            assert!(
+                !err_bad_kind.success() && is_error<InvalidMove>(err_bad_kind.returndata()),
+            )
+        }
+
+        // S0 advances
+        evm.call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::MakeMove { table, kind: 0, target: 0 },
+        )
+
+        // Advance pure state machine through the same round
+        let k0 = unwrap_pure(
+            step(
+                pure_st,
+                pure_digest,
+                Input::Commit { hash: h0 },
+                StepCtx { now, caller: p0.word(), table: table.word(), stake_paid: 0 },
+            ),
+        )
+        let k1 = unwrap_pure(
+            step(
+                k0.state,
+                k0.digest,
+                Input::Commit { hash: h1 },
+                StepCtx { now, caller: p1.word(), table: table.word(), stake_paid: 0 },
+            ),
+        )
+        let k2 = unwrap_pure(
+            step(
+                k1.state,
+                k1.digest,
+                Input::Commit { hash: h2 },
+                StepCtx { now, caller: p2.word(), table: table.word(), stake_paid: 0 },
+            ),
+        )
+        let v0 = unwrap_pure(
+            step(
+                k2.state,
+                k2.digest,
+                Input::Reveal { colour_raw: 1, nonce: (r as u256) * 100 + 1 },
+                StepCtx { now, caller: p0.word(), table: table.word(), stake_paid: 0 },
+            ),
+        )
+        let v1 = unwrap_pure(
+            step(
+                v0.state,
+                v0.digest,
+                Input::Reveal { colour_raw: 0, nonce: (r as u256) * 100 + 2 },
+                StepCtx { now, caller: p1.word(), table: table.word(), stake_paid: 0 },
+            ),
+        )
+        let v2 = unwrap_pure(
+            step(
+                v1.state,
+                v1.digest,
+                Input::Reveal { colour_raw: 0, nonce: (r as u256) * 100 + 3 },
+                StepCtx { now, caller: p2.word(), table: table.word(), stake_paid: 0 },
+            ),
+        )
+        let mv_out = unwrap_pure(
+            step(
+                v2.state,
+                v2.digest,
+                Input::MoveInput { mv: Move::Advance },
+                StepCtx { now, caller: p0.word(), table: table.word(), stake_paid: 0 },
+            ),
+        )
+        pure_st = mv_out.state
+        pure_digest = mv_out.digest
+        assert!(get_digest(table) == pure_digest)
+
+        r = r + 1
+    }
+
+    // Game is now Finished(Won(S0))!
+    // 6. Verify GameFinished error on non-Join action
+    let err_fin = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Poke { table },
+        )
+    assert!(
+        !err_fin.success() && is_error<GameFinished>(err_fin.returndata()),
+    )
+
+    // 7. Verify pull-payment `owed` & `withdraw()` conservation + double-withdraw rejection
+    let owed_p0: Wei = evm
+        .call(
+            addr: table,
+            gas: 200000,
+            value: Wei::zero(),
+            message: TableMsg::GetOwed { player: p0 },
+        )
+    assert!(owed_p0 == wei(stake_val * 3))
+
+    let payee = Address::new(0x7777)
+    let withdrawn: Wei = evm
+        .call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Withdraw { table, to: payee },
+        )
+    assert!(withdrawn == wei(stake_val * 3))
+    assert!(evm.balance(payee) == wei(stake_val * 3))
+
+    // Double withdraw must revert with NothingToWithdraw
+    let err_double_w = evm
+        .try_call(
+            addr: p0,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: ProxyMsg::Withdraw { table, to: payee },
+        )
+    assert!(
+        !err_double_w.success() && is_error<NothingToWithdraw>(err_double_w.returndata()),
+    )
+}
