@@ -118,8 +118,6 @@ pub fn step(_ state: GameState, _ prev_digest: u256, _ input: Input, _ ctx: Step
 | Conservation, bounded loss, survivor safety, unilateral & coalition abort non-profit (P1–P4, P13) | — | — | ✅ Exhaustive Fe test + `5,618`-state model checker + `9/9` Fe mutants killed |
 | Zero rules drift between EVM contract and native binary (P10) | — | — | ✅ `1,000` seeded games on EVM & native + live `anvil` E2E event log replay |
 
-> **Why 5,618 states, not 2,500 or more?** The model checker exhaustively explores the *protocol* (phases, deadlines, forfeits, payouts) at reduced parameters `FINISH=3, ROUND_CAP=5` to keep the search small; it was **not** run at the shipped `FINISH=4, ROUND_CAP=20`. The solver's `2,500` states are a different thing: the board states of the shipped game, used to compute Seat 0's best-response equity. Don't compare the two numbers.
-
 ### Threat Model (what the contract really does)
 
 - **Copy / replay:** a commitment hashes `(domain tag, table address, game id, round, seat, colour, nonce)`, so a copied hash fails at reveal for another seat, round, game or table. Tested in `test_security_copy_commitment_round_replay_and_zero_stake`.
