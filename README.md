@@ -47,7 +47,10 @@ Three players (`S0, S1, S2`) stake `STAKE` wei and race from position `0` to `FI
 
 ## Fe Highlight
 
-In [ingots/outlier_core](./ingots/outlier_core/src/lib.fe), protocol transitions (`step`) and settlement (`settle_forfeit`) have **no `uses` clause** (compiler-verified free of storage, clock, caller, or I/O effects via `error[8-0036]`), use payload `enum`s stored directly in contract storage, and enforce **anti-kingmaking at the type level** by omitting board `Positions` from `settle_forfeit`:
+In [ingots/outlier_core](./ingots/outlier_core/src/lib.fe):
+- **Effect system:** the entire protocol is one pure function, `outlier_core::step`, with no `uses` clause. The compiler verifies it is free of storage, clock, caller, and I/O effects (`error[8-0036]`), so the EVM contract (`outlier_table`) and the native CLI verifier/solver (`outlier_cli`) compile from the exact same source.
+- **Enums with payloads and exhaustive `match`:** a payload `Phase` enum is stored directly in contract storage (`error[8-0034]` on missing arms), so illegal phase/payload states are unconstructible.
+- **Type-level guarantees:** `settle_forfeit(mask, stake)` omits board `Positions` from its signature, so forfeit splits cannot depend on game state (anti-kingmaking).
 
 ```fe
 // ingots/outlier_core/src/types.fe — Illegal phase/payload combinations are unconstructible
