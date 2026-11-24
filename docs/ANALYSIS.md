@@ -1,6 +1,6 @@
 # ANALYSIS.md — Strategic & Game-Theoretic Analysis of OUTLIER
 
-All numbers in this document are produced directly by the **native Fe solver** (`./out/outlier_cli analyze`, source in [ingots/outlier_cli/src/solver.fe](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_cli/src/solver.fe)) and the **independent Python bounded model checker** ([oracle/outlier_model.py](file:///home/devid/codes/projects/outlier-fe/oracle/outlier_model.py)). Reproduce every table with:
+All numbers in this document are produced directly by the **native Fe solver** (`./out/outlier_cli analyze`, source in [ingots/outlier_cli/src/solver.fe](../ingots/outlier_cli/src/solver.fe)) and the **independent Python bounded model checker** ([oracle/outlier_model.py](../oracle/outlier_model.py)). Reproduce every table with:
 
 ```sh
 ./out/outlier_cli analyze
@@ -11,7 +11,7 @@ python3 oracle/outlier_model.py --finish 3 --cap 5 --stake 3
 
 ## 1. Stage-Game Uniform Indifference Theorem (Property P0)
 
-In each round, three seated players (`S0, S1, S2`) simultaneously commit to a colour in `{Red=0, Blue=1, Green=2}`. Let `resolve(c0, c1, c2)` be the stage-game outcome function ([ingots/outlier_core/src/rules.fe](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_core/src/rules.fe#L13-L28)):
+In each round, three seated players (`S0, S1, S2`) simultaneously commit to a colour in `{Red=0, Blue=1, Green=2}`. Let `resolve(c0, c1, c2)` be the stage-game outcome function ([ingots/outlier_core/src/rules.fe](../ingots/outlier_core/src/rules.fe#L13-L28)):
 
 | Category | Count (out of $3^3 = 27$) | Share | Details |
 |---|---|---|---|
@@ -32,7 +32,7 @@ Fix Seat 0's colour $c_0 \in \{R, B, G\}$. Across the $3^2 = 9$ possible opponen
 
 ## 2. Best-Response Value Iteration & the 3-Player Free-Rider Effect
 
-We solve the exact best-response Markov Decision Process (MDP) for Seat 0 in **native Fe** ([ingots/outlier_cli/src/solver.fe](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_cli/src/solver.fe)) using backward induction over all $20 \times 5 \times 5 \times 5 = 2,500$ non-terminal `(round, p0, p1, p2)` states (`FINISH = 4, PUSH = 1, ROUND_CAP = 20`) in fixed-point integer arithmetic (`SCALE = 1_000_000`, where `1_000_000 = 100.00%` pot share and a 3-way tie at `ROUND_CAP` pays `1/3 = 33.33%`).
+We solve the exact best-response Markov Decision Process (MDP) for Seat 0 in **native Fe** ([ingots/outlier_cli/src/solver.fe](../ingots/outlier_cli/src/solver.fe)) using backward induction over all $20 \times 5 \times 5 \times 5 = 2,500$ non-terminal `(round, p0, p1, p2)` states (`FINISH = 4, PUSH = 1, ROUND_CAP = 20`) in fixed-point integer arithmetic (`SCALE = 1_000_000`, where `1_000_000 = 100.00%` pot share and a 3-way tie at `ROUND_CAP` pays `1/3 = 33.33%`).
 
 Opponent baseline policy for `S1` and `S2`: advance if advancing reaches `FINISH (4)`; otherwise push the strict leader if that leader is at `FINISH - 1 (3)`; otherwise advance.
 
@@ -85,7 +85,7 @@ In simultaneous hidden-move protocols, the last revealer observes the earlier re
 OUTLIER eliminates both attacks structurally:
 1. **Unilateral abort never beats honest play (P1–P4):** A player who misses a `Commit` or `Reveal` deadline forfeits their entire `STAKE` (`net = -STAKE`), which equals the worst possible honest-play net payoff (`-STAKE`), while survivors receive their own stake back plus `ceil(STAKE/2)` and `floor(STAKE/2)` (`net >= 0`).
 2. **Stalling `WinnerMove` cannot grieve opponents:** A round winner who fails to submit a move before `MOVE_WINDOW` expires is defaulted to `Move::Advance` upon any permissionless `Poke`.
-3. **Anti-kingmaking by type signature (P5):** `settle_forfeit(_ mask: u8, _ stake: u256) -> [u256; 3]` ([ingots/outlier_core/src/settle.fe](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_core/src/settle.fe#L12-L59)) does **not** accept board `Positions` or `round` as arguments. A losing player cannot time an abort to steer the forfeited pot toward whichever opponent is currently leading on the board.
+3. **Anti-kingmaking by type signature (P5):** `settle_forfeit(_ mask: u8, _ stake: u256) -> [u256; 3]` ([ingots/outlier_core/src/settle.fe](../ingots/outlier_core/src/settle.fe#L12-L59)) does **not** accept board `Positions` or `round` as arguments. A losing player cannot time an abort to steer the forfeited pot toward whichever opponent is currently leading on the board.
 4. **Coalition forfeit non-profit (P13):** For any non-empty coalition $C \subseteq \{S_0, S_1, S_2\}$ that causes all forfeits in a game ($\text{mask} \subseteq C$), total coalition net profit is $\sum_{i \in C} (\text{payout}_i - \text{STAKE}) \le 0$ for all stakes (`0, 1, 2, 3, 1001`).
 
 ### Bounded Model Checker & Mutation Summary

@@ -1,7 +1,7 @@
 # OUTLIER — Specification v1.0 (authoritative)
 
 **Status:** locked defaults. Change only via an ADR in `docs/DECISIONS.md`, and regenerate oracle vectors and golden digests in the same commit.
-**Executable counterpart:** [oracle/outlier_model.py](file:///home/devid/codes/projects/outlier-fe/oracle/outlier_model.py) implements this spec independently and checks properties P0–P9 and P13 exhaustively for small parameters (see §12 for what was actually run).
+**Executable counterpart:** [oracle/outlier_model.py](../oracle/outlier_model.py) implements this spec independently and checks properties P0–P9 and P13 exhaustively for small parameters (see §12 for what was actually run).
 **Notation:** MUST / MUST NOT are requirements on the implementation. "Seat" = player slot 0, 1, 2.
 
 ---

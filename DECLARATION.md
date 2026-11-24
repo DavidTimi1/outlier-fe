@@ -15,4 +15,17 @@
 
 ## 3. AI Assistance
 
-AI coding assistants were used for specification refinement, Fe 26.6.0 stdlib exploration, dual-backend implementation, mutation testing, native Fe value-iteration solver verification, and documentation. The human author reviewed, tested, and takes full responsibility for all code and claims in this submission.
+| Tool | What it produced |
+|---|---|
+| **Claude** (chat, before usage limits were reached) | First drafts of the idea evaluation against the judging rubric, `SPEC.md`, `ARCHITECTURE.md`, `PLAN.md`, and the agent operating rules (`AGENTS.md`). |
+| **Google Antigravity coding agent** (models selected in the app: Gemini and Claude Sonnet) | Consolidated and updated the plan and docs; wrote the Fe code in `ingots/` (core, contract, CLI, solver, testkit); wrote the Python oracle and scripts in `oracle/` and `scripts/`; wrote the tests; wrote the README, SUBMISSION, ANALYSIS, PATTERN and FE_FINDINGS docs; and ran compile/test loops, fixing its own errors. |
+
+**What the human author did:** chose the project, the rules of the game and the judging-driven scope; ran the agent, reviewed its output and decisions, and committed the work. The gate commands listed in the README ("Build and Test") were run in the author's workspace, and the demo transcript was produced by `scripts/run_demo.sh`. The author is still learning parts of the code and relies on the tests and the oracle, not on personal line-by-line review, for correctness evidence.
+
+**Limits of that evidence:** the Python oracle and the Fe code were both produced with AI assistance from the same `SPEC.md`, so they are independent *implementations* but not independent *readings of the spec*. A spec misreading would not be caught by them.
+
+A session-by-session log, including dead ends, is kept in `docs/AI_LOG.md` (kept out of the public repo by `.gitignore`; available on request).
+
+## 4. Other Projects Consulted
+
+No other contest entry was copied or used as a source. (`devprashant19/Leash` was not consulted.)

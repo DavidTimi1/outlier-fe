@@ -9,17 +9,17 @@ Written from hands-on compilation and dual-target verification with **`fe 26.6.0
 ### A. Dual EVM + Native Compilation of the Same Protocol Core (Zero Drift)
 In Solidity, the on-chain contract and any off-chain replay verifier, CLI simulator, or game-theoretic solver must be written in two different languages (e.g., Solidity + TypeScript/Python/Rust), creating permanent drift risk around integer overflow, ABI packing, or Keccak padding.
 
-In Fe 26.6.0, `core::intrinsic::__keccak_words` compiles to the native EVM `KECCAK256` opcode under `--backend sonatina` **and** executes natively under `--backend native`. As a result, [ingots/outlier_core](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_core/src/lib.fe) is compiled into:
+In Fe 26.6.0, `core::intrinsic::__keccak_words` compiles to the native EVM `KECCAK256` opcode under `--backend sonatina` **and** executes natively under `--backend native`. As a result, [ingots/outlier_core](../ingots/outlier_core/src/lib.fe) is compiled into:
 1. **`OutlierTable` (`22,616 B` EVM runtime bytecode)** — the on-chain referee and pull-payment escrow.
 2. **`outlier_cli` (`332 KB` Linux x86-64 ELF binary)** — the off-chain simulator, `OUTLIER-LOG 1` replay verifier, and 2,500-state backward-induction value-iteration solver.
 
-When we deployed `OutlierTable` on live Foundry `anvil` ([scripts/anvil_replay_e2e.py](file:///home/devid/codes/projects/outlier-fe/scripts/anvil_replay_e2e.py)) and piped the real emitted `Transition` event logs into `./out/outlier_cli replay`, the native binary verified all 31 transitions of Game #1 and all 9 time-warped forfeit transitions of Game #2 bit-for-bit on the first run.
+When we deployed `OutlierTable` on live Foundry `anvil` ([scripts/anvil_replay_e2e.py](../scripts/anvil_replay_e2e.py)) and piped the real emitted `Transition` event logs into `./out/outlier_cli replay`, the native binary verified all 31 transitions of Game #1 and all 9 time-warped forfeit transitions of Game #2 bit-for-bit on the first run.
 
 ### B. `uses` Effect System as an Architectural Firewall
 In Solidity, nothing prevents a "pure" helper library or internal function from reading `block.timestamp`, `msg.sender`, or `address(this)` unless marked `pure`—and Solidity's `pure` cannot be composed with fine-grained host capabilities in off-chain tools.
 
 In Fe 26.6.0:
-- Every function in `ingots/outlier_core` has **no `uses` clause**. Attempting to call an effectful function fails with `error[8-0036]: missing effect Ctx` ([test/compile_fail/cf_01_pure_effect.fe](file:///home/devid/codes/projects/outlier-fe/test/compile_fail/cf_01_pure_effect.fe)).
+- Every function in `ingots/outlier_core` has **no `uses` clause**. Attempting to call an effectful function fails with `error[8-0036]: missing effect Ctx` ([test/compile_fail/cf_01_pure_effect.fe](../test/compile_fail/cf_01_pure_effect.fe)).
 - In `ingots/outlier_cli`, `pub fn main() uses (host: mut Host)` projects only the exact capabilities each subcommand is allowed to touch:
   - `cmd_explain`, `cmd_vectors`, `cmd_analyze`: `uses (out: mut Stdout)` (cannot read or write files, cannot exit early).
   - `cmd_replay`: `uses (args: Args, out: mut Stdout, err: mut Stderr, fs: Fs, proc: Exit)` — receives **read-only `fs: Fs`** rather than `mut Fs`, statically guaranteeing the replay verifier cannot modify the log file it is auditing.
@@ -40,7 +40,7 @@ pub enum Phase {
 }
 ```
 
-Omitting any `Phase` variant in a `match` fails at compile time with `error[8-0034]: non-exhaustive patterns` ([test/compile_fail/cf_02_nonexhaustive_phase.fe](file:///home/devid/codes/projects/outlier-fe/test/compile_fail/cf_02_nonexhaustive_phase.fe)).
+Omitting any `Phase` variant in a `match` fails at compile time with `error[8-0034]: non-exhaustive patterns` ([test/compile_fail/cf_02_nonexhaustive_phase.fe](../test/compile_fail/cf_02_nonexhaustive_phase.fe)).
 
 ### D. Exact Custom Error Selector Testing Without Foundry Test Boilerplate
 Fe 26.6.0's `#[error] pub struct BadReveal {}` + `std::evm::effects::revert_error` + `evm.try_call` + `std::evm::returndata::is_error<BadReveal>(out.returndata())` allowed us to test all 14 custom error selectors and assert state immutability on revert directly in `fe test` without needing bare, vacuous `#[test(should_revert)]` attributes.

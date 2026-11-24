@@ -1,6 +1,19 @@
-# OUTLIER — Zero-Drift Simultaneous Hidden-Move Protocol, Verifier & Solver in Pure Fe
+# OUTLIER — A Three-Player Hidden-Move Game as One Pure Fe State Machine
 
-**Pitch:** OUTLIER is a three-player simultaneous hidden-move protocol and game whose entire rule set is one pure Fe state machine (`outlier_core::step`), so the on-chain EVM referee (`OutlierTable`, 22,616 B) and the off-chain native CLI verifier and game-theoretic solver (`outlier_cli`, 332 KB ELF binary) compile from the exact same Fe source with zero code drift.
+**Pitch:** OUTLIER is a three-player hidden-move game whose whole protocol is one pure Fe state machine, so the on-chain contract and the off-chain verifier run the same rules code and every game can be replayed and re-verified step by step.
+
+---
+
+## 60-Second Tour
+
+```sh
+fe build -i outlier_cli --backend native --emit executable --out-dir out   # build the native Fe CLI
+./scripts/run_demo.sh                                                      # play, replay, tamper-check, analyze
+diff <(./scripts/run_demo.sh) demo/transcript.txt && echo "transcript reproduces"
+```
+
+What you will see: a full 3-player game is played and replayed (`VERIFIED 43 transitions`), a stalled player is forfeited and settled (`VERIFIED 16 transitions`), a corrupted log is rejected (`DIVERGENCE at step 8`), and the solver prints its strategy tables. The same `step` function also runs inside the EVM contract (`fe test -i outlier_table`).
+
 
 ---
 
@@ -8,9 +21,9 @@
 
 Simultaneous hidden-move protocols on the EVM — sealed-bid auctions, commit-reveal voting, MEV-resistant batching, and multi-player games — fail in practice for three reasons:
 
-1. **Abort & Kingmaking Attacks:** The last revealer sees earlier reveals and can withhold their reveal if they would lose, or deliberately time an abort in a $N \ge 3$ participant protocol to choose *which* opponent wins the forfeited pot.
+1. **Abort & Forfeit-Timing Kingmaking Attacks:** The last revealer sees earlier reveals and can withhold their reveal if they would lose, or deliberately time an abort in a $N \ge 3$ participant protocol to choose *which* opponent wins the forfeited pot.
 2. **State-Machine & Storage Corruption:** Solidity encodes multi-phase protocols using flat structs of loose integers, booleans, and sentinel zeros that allow illegal phase/payload combinations and forgotten deadline paths.
-3. **On-Chain vs. Off-Chain Code Drift:** Because Solidity only compiles to the EVM, off-chain replay verifiers, simulators, and strategic solvers must be rewritten in TypeScript, Python, or Rust — creating subtle ABI, integer-width, or Keccak padding divergences.
+3. **On-Chain vs. Off-Chain Rules Drift:** Because Solidity only compiles to the EVM, off-chain replay verifiers, simulators, and strategic solvers must be rewritten in TypeScript, Python, or Rust — creating subtle ABI, integer-width, or Keccak padding divergences.
 
 **OUTLIER** solves all three problems as a reusable architectural pattern in **Fe 26.6.0**, demonstrated through a non-trivial three-player game of hidden information and positional interference.
 
@@ -31,7 +44,7 @@ Three players (`S0, S1, S2`) stake `STAKE` wei and race from position `0` to `FI
 
 ## Fe Highlight
 
-In [ingots/outlier_core](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_core/src/lib.fe), protocol transitions (`step`) and settlement (`settle_forfeit`) have **no `uses` clause** (compiler-verified free of storage, clock, caller, or I/O effects via `error[8-0036]`), use payload `enum`s stored directly in contract storage, and enforce **anti-kingmaking at the type level** by omitting board `Positions` from `settle_forfeit`:
+In [ingots/outlier_core](./ingots/outlier_core/src/lib.fe), protocol transitions (`step`) and settlement (`settle_forfeit`) have **no `uses` clause** (compiler-verified free of storage, clock, caller, or I/O effects via `error[8-0036]`), use payload `enum`s stored directly in contract storage, and enforce **anti-kingmaking at the type level** by omitting board `Positions` from `settle_forfeit`:
 
 ```fe
 // ingots/outlier_core/src/types.fe — Illegal phase/payload combinations are unconstructible
@@ -51,12 +64,7 @@ pub fn settle_forfeit(_ mask: u8, _ stake: u256) -> [u256; 3]
 pub fn step(_ state: GameState, _ prev_digest: u256, _ input: Input, _ ctx: StepCtx) -> Result<StepError, StepOut>
 ```
 
-And in [ingots/outlier_cli/src/lib.fe](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_cli/src/lib.fe), Fe 26.6.0's capability projection narrows the native `Host` effect so `replay` receives **read-only `fs: Fs`** while `explain`, `vectors`, and `analyze` have **zero filesystem capability**:
-
-```fe
-fn cmd_analyze() uses (out: mut Stdout) { ... }
-fn cmd_replay() uses (args: Args, out: mut Stdout, err: mut Stderr, fs: Fs, proc: Exit) { ... }
-```
+*(The native CLI's per-command capability projection is described in [docs/FE_FINDINGS.md](./docs/FE_FINDINGS.md).)*
 
 ---
 
@@ -86,11 +94,11 @@ fn cmd_replay() uses (args: Args, out: mut Stdout, err: mut Stderr, fs: Fs, proc
 
 | Component | Path | Target | Description |
 |---|---|---|---|
-| **`outlier_core`** | [ingots/outlier_core](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_core/src/lib.fe) | EVM + Native | Pure types, rules, reusable `commit_reveal`, `step`, `settle`, 15-word `encode_state` & 16-word `digest_next` |
-| **`outlier_table`** | [ingots/outlier_table](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_table/src/lib.fe) | EVM (`sonatina`) | Thin `OutlierTable` contract (`22,616 B` runtime), 14 typed `#[error]`s, 8 `#[event]`s, pull-payment `withdraw()` |
-| **`outlier_cli`** | [ingots/outlier_cli](file:///home/devid/codes/projects/outlier-fe/ingots/outlier_cli/src/lib.fe) | Native (`x86-64`) | Native Fe CLI (`explain`, `vectors`, `play`, `replay`, and `analyze` 2,500-state DP solver & agent simulator) |
-| **`testkit`** | [ingots/testkit](file:///home/devid/codes/projects/outlier-fe/ingots/testkit/src/lib.fe) | EVM + Native | `SplitMix64` PRNG and 1,000-game dual-backend parity suite |
-| **Oracle & Scripts** | [oracle/outlier_model.py](file:///home/devid/codes/projects/outlier-fe/oracle/outlier_model.py), `scripts/` | Python 3 / Bash | Independent bounded model checker, oracle conformance codegen, compile-fail & Fe mutation testers, live `anvil` E2E bridge |
+| **`outlier_core`** | [ingots/outlier_core](./ingots/outlier_core/src/lib.fe) | EVM + Native | Pure types, rules, reusable `commit_reveal`, `step`, `settle`, 15-word `encode_state` & 16-word `digest_next` |
+| **`outlier_table`** | [ingots/outlier_table](./ingots/outlier_table/src/lib.fe) | EVM (`sonatina`) | Thin `OutlierTable` contract (`22,616 B` runtime), 14 typed `#[error]`s, 8 `#[event]`s, pull-payment `withdraw()` |
+| **`outlier_cli`** | [ingots/outlier_cli](./ingots/outlier_cli/src/lib.fe) | Native (`x86-64`) | Native Fe CLI (`explain`, `vectors`, `play`, `replay`, and `analyze` 2,500-state DP solver & agent simulator) |
+| **`testkit`** | [ingots/testkit](./ingots/testkit/src/lib.fe) | EVM + Native | `SplitMix64` PRNG and 1,000-game dual-backend parity suite |
+| **Oracle & Scripts** | [oracle/outlier_model.py](./oracle/outlier_model.py), `scripts/` | Python 3 / Bash | Independent bounded model checker, oracle conformance codegen, compile-fail & Fe mutation testers, live `anvil` E2E bridge |
 
 ### What Enforces What (Radical Honesty Table)
 
@@ -102,7 +110,18 @@ fn cmd_replay() uses (args: Args, out: mut Stdout, err: mut Stderr, fs: Fs, proc
 | Forfeit settlement cannot depend on board positions (no timed-abort kingmaking, P5) | ✅ `settle_forfeit(mask, stake)` signature rejects `Positions` | — | `oracle/outlier_model.py` + `tests.fe` |
 | Caller identity, turn ownership, deadlines (`<=` vs `>`), & 7-word commitment match | — | ✅ Checked inside `step`; reverts with 4-byte `#[error]` selector | All 14 errors verified via `evm.try_call` + `is_error<E>` |
 | Conservation, bounded loss, survivor safety, unilateral & coalition abort non-profit (P1–P4, P13) | — | — | ✅ Exhaustive Fe test + `5,618`-state model checker + `9/9` Fe mutants killed |
-| Zero drift between EVM contract and native binary (P10) | — | — | ✅ `1,000` seeded games on EVM & native + live `anvil` E2E event log replay |
+| Zero rules drift between EVM contract and native binary (P10) | — | — | ✅ `1,000` seeded games on EVM & native + live `anvil` E2E event log replay |
+
+> **Why 5,618 states, not 2,500 or more?** The model checker exhaustively explores the *protocol* (phases, deadlines, forfeits, payouts) at reduced parameters `FINISH=3, ROUND_CAP=5` to keep the search small; it was **not** run at the shipped `FINISH=4, ROUND_CAP=20`. The solver's `2,500` states are a different thing: the board states of the shipped game, used to compute Seat 0's best-response equity. Don't compare the two numbers.
+
+### Threat Model (what the contract really does)
+
+- **Copy / replay:** a commitment hashes `(domain tag, table address, game id, round, seat, colour, nonce)`, so a copied hash fails at reveal for another seat, round, game or table. Tested in `test_security_copy_commitment_round_replay_and_zero_stake`.
+- **Last-revealer abort:** whoever stalls in Commit or Reveal forfeits their stake. Anyone can call `poke()` after the deadline. The forfeit split is computed from the set of stallers and the stake only, never from board positions (`settle_forfeit(mask, stake)`).
+- **Reentrancy in `withdraw()`:** `owed` is set to zero before the external `send_value` call (checks-effects-interactions), and payouts are pull-based. There is no separate reentrancy lock, and no dedicated malicious-receiver test exists.
+- **Timestamp reliance:** deadlines use `block.timestamp` (passed into `step` as `now`). Block producers can shift it slightly; the windows are 600 s (3,600 s for joining), so this is a small effect, but it is not eliminated.
+- **Size:** `OutlierTable` runtime is 22,616 B against the EIP-170 limit of 24,576 B (from `fe build --emit sizes`).
+- **Not covered:** no audit, no mainnet deployment, no fee or gas-griefing analysis.
 
 ---
 
@@ -136,7 +155,7 @@ python3 scripts/anvil_replay_e2e.py
 
 ## Demo
 
-Run the entire deterministic demo in one command (`make demo` or `./scripts/run_demo.sh`), which reproduces [demo/transcript.txt](file:///home/devid/codes/projects/outlier-fe/demo/transcript.txt) byte-for-byte:
+Run the entire deterministic demo in one command (`make demo` or `./scripts/run_demo.sh`), which reproduces [demo/transcript.txt](./demo/transcript.txt) byte-for-byte:
 
 ```sh
 ./scripts/run_demo.sh
@@ -149,15 +168,15 @@ What the demo executes using the native Fe binary `./out/outlier_cli`:
 4. **Tamper Detection**: Corrupts 1 hex character at step 8 of `demo/game1.log` and runs `./out/outlier_cli replay` → exits non-zero with `DIVERGENCE at step 8: expected 0x48b61fd7...6a, got 0x48b61fd7...6c`.
 5. **`./out/outlier_cli analyze` (Native Fe Solver & Strategic Simulator)**:
    - Exhaustively proves the 27-triple stage-game uniform indifference theorem (`2/9 = 22.22%` per colour).
-   - Solves all `2,500` `(round, p0, p1, p2)` states by backward induction (`V(1,(0,0,0)) = 34.52%`) and prints the **Advance-vs-Push Decision Boundary Table**, uncovering the **3-Player Free-Rider Effect**: pushing a leader at `FINISH - 1 (3)` is optimal when the third player is at `0` (`(2,3,0)`: `PUSH(S1) = 44.84% > ADVANCE = 43.26%`), but advancing dominates when the third player is in contention (`(1,3,1)`: `ADVANCE = 28.07% > PUSH(S1) = 27.53%`).
-   - Simulates 300 full commit-reveal games per regime through `outlier_core::step`, showing a Laplace frequency-tracking agent increasing Seat 0's win rate from **`27.33%` → `46.00%`** against a `70%`-Red biased opponent without breaking commitment hiding.
+   - Solves all `2,500` `(round, p0, p1, p2)` states by backward induction (`V(1,(0,0,0)) = 34.52%` for Seat 0 against opponents that follow a fixed policy: advance if that reaches `FINISH`, else push a leader sitting at `FINISH - 1`, else advance; this is a best-response value, not a Nash equilibrium) and prints the **Advance-vs-Push Decision Boundary Table**, uncovering the **3-Player Free-Rider Effect**: pushing a leader at `FINISH - 1 (3)` is optimal when the third player is at `0` (`(2,3,0)`: `PUSH(S1) = 44.84% > ADVANCE = 43.26%`), but advancing dominates when the third player is in contention (`(1,3,1)`: `ADVANCE = 28.07% > PUSH(S1) = 27.53%`).
+   - Simulates 300 full commit-reveal games per regime (seeds `1..=300`, one run, no confidence interval) through `outlier_core::step`, showing a Laplace frequency-tracking agent increasing Seat 0's win rate from **`27.33%` → `46.00%`** against a `70%`-Red biased opponent (Seat 2 uniform) without breaking commitment hiding.
 
 ### Deep-Dive Documentation
-- [docs/SPEC.md](file:///home/devid/codes/projects/outlier-fe/docs/SPEC.md) — Authoritative protocol specification, 15-word state layout, and properties P0–P13.
-- [docs/ARCHITECTURE.md](file:///home/devid/codes/projects/outlier-fe/docs/ARCHITECTURE.md) — Layered pure-core / thin-adapter architecture and honesty table.
-- [docs/PATTERN.md](file:///home/devid/codes/projects/outlier-fe/docs/PATTERN.md) — Reusable Fe pattern guide with an 18-line Sealed-Bid Auction built on `outlier_core::commit_reveal`.
-- [docs/ANALYSIS.md](file:///home/devid/codes/projects/outlier-fe/docs/ANALYSIS.md) — Full game-theoretic proofs, solver decision boundary analysis, and empirical simulation tables.
-- [docs/FE_FINDINGS.md](file:///home/devid/codes/projects/outlier-fe/docs/FE_FINDINGS.md) — Fe 26.6.0 vs. Solidity comparison and compiler/codegen findings (including the 9,829-byte `#[inline(never)]` storage-adapter optimization).
+- [docs/SPEC.md](./docs/SPEC.md) — Authoritative protocol specification, 15-word state layout, and properties P0–P13.
+- [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) — Layered pure-core / thin-adapter architecture and honesty table.
+- [docs/PATTERN.md](./docs/PATTERN.md) — Reusable Fe pattern guide with an illustrative (untested) sealed-bid auction sketch built on `outlier_core::commit_reveal`.
+- [docs/ANALYSIS.md](./docs/ANALYSIS.md) — Full game-theoretic proofs, solver decision boundary analysis, and empirical simulation tables.
+- [docs/FE_FINDINGS.md](./docs/FE_FINDINGS.md) — Fe 26.6.0 vs. Solidity comparison and compiler/codegen findings (including the 9,829-byte `#[inline(never)]` storage-adapter optimization).
 
 ---
 
@@ -172,7 +191,7 @@ What the demo executes using the native Fe binary `./out/outlier_cli`:
 
 ## Declaration
 
-See [DECLARATION.md](file:///home/devid/codes/projects/outlier-fe/DECLARATION.md) for the complete declaration:
+See [DECLARATION.md](./DECLARATION.md) for the complete declaration:
 - **Pre-existing work:** None prior to November 3, 2026 (started from `fe-lang/builders-challenge-starter`).
 - **Third-party code:** None (100% original Fe and Python test-oracle code written for this entry).
 - **AI assistance:** AI coding tools were used for specification refinement, Fe 26.6.0 stdlib spike discovery, implementation, mutation testing, and documentation; the human author reviewed, tested, and takes full responsibility for all code and claims.
@@ -187,4 +206,4 @@ See [DECLARATION.md](file:///home/devid/codes/projects/outlier-fe/DECLARATION.md
 
 ## License
 
-Apache-2.0 — see [LICENSE](file:///home/devid/codes/projects/outlier-fe/LICENSE).
+Apache-2.0 — see [LICENSE](./LICENSE).
