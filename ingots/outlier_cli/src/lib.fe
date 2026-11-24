@@ -10,8 +10,14 @@
 // - `cmd_replay`: `uses (args: Args, out: mut Stdout, err: mut Stderr, fs: Fs)` (READ-ONLY `Fs`!)
 
 use core::MemBuffer
-pub use hex::{parse_u256_slice, push_dec, push_hex_u256}
-pub use log_v1::{play_and_log, verify_log_buffer, write_log_header, write_log_step}
+pub use hex::{parse_u256_slice, push_dec, push_hex_short, push_hex_u256}
+pub use log_v1::{
+    play_and_log,
+    play_and_log_with_opts,
+    verify_log_buffer,
+    write_log_header,
+    write_log_step,
+}
 use outlier_core::{
     COMMIT_WINDOW,
     Colour,
@@ -39,29 +45,45 @@ use testkit::rolling_parity_range
 
 fn cmd_explain() uses (out: mut Stdout) {
     var buf = MemBuffer::empty()
-    "OUTLIER Protocol Specification v1.0 (Pure Fe State Machine)\n".fmt(mut buf)
-    "  Rule        : 3 players commit-reveal {Red=0, Blue=1, Green=2}. If exactly two match,\n"
-        .fmt(mut buf)
-    "                the odd one out (the outlier) wins the round and chooses:\n".fmt(mut buf)
-    "                Move::Advance (+1 up to FINISH) or Move::Push(target) (-PUSH down to 0).\n"
-        .fmt(mut buf)
+    "==============================================================================\n".fmt(mut buf)
+    "    ___    _   _   _____   _       ___   _____   ____  \n".fmt(mut buf)
+    "   / _ \\  | | | | |_   _| | |     |_ _| | ____| |  _ \\ \n".fmt(mut buf)
+    "  | | | | | | | |   | |   | |      | |  |  _|   | |_) |\n".fmt(mut buf)
+    "  | |_| | | |_| |   | |   | |___   | |  | |___  |  _ < \n".fmt(mut buf)
+    "   \\___/   \\___/    |_|   |_____| |___| |_____| |_| \\_\\\n\n".fmt(mut buf)
+    "   THREE-PLAYER HIDDEN-MOVE PROTOCOL  //  ONE PURE FE STATE MACHINE\n".fmt(mut buf)
+    "   Same `outlier_core::step` compiles to:  [EVM Contract]  +  [Native CLI]\n".fmt(mut buf)
+    "==============================================================================\n\n".fmt(mut buf)
+    "  (1) SEALED KECCAK COMMIT         (2) ODD-ONE-OUT REVEAL          (3) WINNER MOVE\n".fmt(mut buf)
+    "  +------------------------+       +-------------------------+     +---------------+\n".fmt(mut buf)
+    "  | S0: [SEALED 0x2e..98]  |       | S0: [ RED   ] --+       |     |   +1 ===>     |\n".fmt(mut buf)
+    "  |                        |       |                 +- MATCH|     |   ADVANCE     |\n".fmt(mut buf)
+    "  | S1: [SEALED 0x8a..c2]  | ====> | S1: [ RED   ] --+       |     |      or       |\n".fmt(mut buf)
+    "  |                        |       |                         |     |   -1 <===     |\n".fmt(mut buf)
+    "  | S2: [SEALED 0x1b..a3]  |       | S2: < BLUE  > * OUTLIER!| ==> |   PUSH(opp)   |\n".fmt(mut buf)
+    "  +------------------------+       +-------------------------+     +---------------+\n".fmt(mut buf)
+    "   7-word Keccak-256 lockbox        keccak(colour,nonce) check      Race 0 ---> 4*\n\n".fmt(mut buf)
+    "  (4) ANTI-KINGMAKING FORFEIT: `settle_forfeit(mask, stake) -> [u256; 3]`\n".fmt(mut buf)
+    "      Stallers forfeit stake; survivors split ceil/floor(STAKE/2) independently\n".fmt(mut buf)
+    "      of board positions (board `Positions` omitted from the type signature!).\n\n".fmt(mut buf)
+    "------------------------------------------------------------------------------\n".fmt(mut buf)
     "  Parameters  : FINISH=".fmt(mut buf)
     push_dec(mut buf, FINISH as u256)
-    " PUSH=".fmt(mut buf)
+    "  |  PUSH=".fmt(mut buf)
     push_dec(mut buf, PUSH as u256)
-    " ROUND_CAP=".fmt(mut buf)
+    "  |  ROUND_CAP=".fmt(mut buf)
     push_dec(mut buf, ROUND_CAP as u256)
     "\n  Windows (s) : JOIN=".fmt(mut buf)
     push_dec(mut buf, JOIN_WINDOW)
-    " COMMIT=".fmt(mut buf)
+    " |  COMMIT=".fmt(mut buf)
     push_dec(mut buf, COMMIT_WINDOW)
-    " REVEAL=".fmt(mut buf)
+    " |  REVEAL=".fmt(mut buf)
     push_dec(mut buf, REVEAL_WINDOW)
-    " MOVE=".fmt(mut buf)
+    " |  MOVE=".fmt(mut buf)
     push_dec(mut buf, MOVE_WINDOW)
     "\n  DOMAIN_TAG  : ".fmt(mut buf)
     push_hex_u256(mut buf, DOMAIN_TAG)
-    "\n".fmt(mut buf)
+    "\n==============================================================================\n".fmt(mut buf)
     print_buffer(buf)
 }
 
@@ -133,6 +155,7 @@ fn cmd_play() uses (args: Args, out: mut Stdout, fs: mut Fs, proc: Exit) {
     var mode: u8 = 0
     var stake: u256 = 1001
     var out_idx: usize = 0
+    var show_steps = false
 
     var i: usize = 2
     while i < argc {
@@ -168,6 +191,9 @@ fn cmd_play() uses (args: Args, out: mut Stdout, fs: mut Fs, proc: Exit) {
         } else if a == "--out" && (i + 1) < argc {
             out_idx = i + 1
             i = i + 2
+        } else if a == "--steps" {
+            show_steps = true
+            i = i + 1
         } else {
             i = i + 1
         }
@@ -175,7 +201,15 @@ fn cmd_play() uses (args: Args, out: mut Stdout, fs: mut Fs, proc: Exit) {
 
     var trace_buf = MemBuffer::empty()
     var log_buf = MemBuffer::empty()
-    let _ = play_and_log(seed, mode, stake, 0xCAFE, mut trace_buf, mut log_buf)
+    let _ = play_and_log_with_opts(
+        seed,
+        mode,
+        stake,
+        0xCAFE,
+        show_steps,
+        mut trace_buf,
+        mut log_buf,
+    )
     print_buffer(trace_buf)
 
     if out_idx > 0 {
