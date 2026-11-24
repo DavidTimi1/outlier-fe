@@ -16,6 +16,8 @@ fe build -i outlier_cli --backend native --emit executable --out-dir out
 Start with [docs/PATTERN.md](./docs/PATTERN.md) (reusable pattern, 18-line sealed-bid auction)
 or [docs/FE_FINDINGS.md](./docs/FE_FINDINGS.md) (compiler findings, Fe vs Solidity).
 
+![OUTLIER Native Fe CLI Protocol Schematic](./demo/cli_explain.png)
+
 ---
 
 ## The Problem
@@ -174,6 +176,10 @@ To watch a game unfold round by round—showing the 3 sealed 7-word Keccak-256 c
 ./out/outlier_cli play --seed 1 --stake 1001 --steps --out demo/game1.log
 ```
 *(Optional interactive mode: `./scripts/walkthrough.sh --play` lets you play Seat S0 against Bot S1 & Bot S2 and verifies your resulting `demo/human_game.log` through `./out/outlier_cli replay`.)*
+
+![OUTLIER Step-by-Step Round Card and 3-Lane Race Track](./demo/cli_walkthrough.png)
+
+![OUTLIER Final Settlement Board and Replay Verification](./demo/cli_final_board.png)
 
 What `./scripts/run_demo.sh` executes using the native Fe binary `./out/outlier_cli`:
 1. **`./out/outlier_cli explain` & `./out/outlier_cli vectors`**: Prints protocol parameters and verifies embedded Foundry `cast` Keccak vectors (`COMMIT_VEC_0`, `COMMIT_VEC_1`, `DIGEST_JOIN_1`, `PARITY_BATCH_1_100`).
