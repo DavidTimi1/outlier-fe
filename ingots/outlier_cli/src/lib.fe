@@ -53,19 +53,30 @@ fn cmd_explain() uses (out: mut Stdout) {
     "   \\___/   \\___/    |_|   |_____| |___| |_____| |_| \\_\\\n\n".fmt(mut buf)
     "   THREE-PLAYER HIDDEN-MOVE PROTOCOL  //  ONE PURE FE STATE MACHINE\n".fmt(mut buf)
     "   Same `outlier_core::step` compiles to:  [EVM Contract]  +  [Native CLI]\n".fmt(mut buf)
-    "==============================================================================\n\n".fmt(mut buf)
-    "  (1) SEALED KECCAK COMMIT         (2) ODD-ONE-OUT REVEAL          (3) WINNER MOVE\n".fmt(mut buf)
-    "  +------------------------+       +-------------------------+     +---------------+\n".fmt(mut buf)
-    "  | S0: [SEALED 0x2e..98]  |       | S0: [ RED   ] --+       |     |   +1 ===>     |\n".fmt(mut buf)
-    "  |                        |       |                 +- MATCH|     |   ADVANCE     |\n".fmt(mut buf)
-    "  | S1: [SEALED 0x8a..c2]  | ====> | S1: [ RED   ] --+       |     |      or       |\n".fmt(mut buf)
-    "  |                        |       |                         |     |   -1 <===     |\n".fmt(mut buf)
-    "  | S2: [SEALED 0x1b..a3]  |       | S2: < BLUE  > * OUTLIER!| ==> |   PUSH(opp)   |\n".fmt(mut buf)
-    "  +------------------------+       +-------------------------+     +---------------+\n".fmt(mut buf)
-    "   7-word Keccak-256 lockbox        keccak(colour,nonce) check      Race 0 ---> 4*\n\n".fmt(mut buf)
+    "==============================================================================\n\n"
+        .fmt(mut buf)
+    "  (1) SEALED KECCAK COMMIT         (2) ODD-ONE-OUT REVEAL          (3) WINNER MOVE\n"
+        .fmt(mut buf)
+    "  +------------------------+       +-------------------------+     +---------------+\n"
+        .fmt(mut buf)
+    "  | S0: [SEALED 0x2e..98]  |       | S0: [ RED   ] --+       |     |   +1 ===>     |\n"
+        .fmt(mut buf)
+    "  |                        |       |                 +- MATCH|     |   ADVANCE     |\n"
+        .fmt(mut buf)
+    "  | S1: [SEALED 0x8a..c2]  | ====> | S1: [ RED   ] --+       |     |      or       |\n"
+        .fmt(mut buf)
+    "  |                        |       |                         |     |   -1 <===     |\n"
+        .fmt(mut buf)
+    "  | S2: [SEALED 0x1b..a3]  |       | S2: < BLUE  > * OUTLIER!| ==> |   PUSH(opp)   |\n"
+        .fmt(mut buf)
+    "  +------------------------+       +-------------------------+     +---------------+\n"
+        .fmt(mut buf)
+    "   7-word Keccak-256 lockbox        keccak(colour,nonce) check      Race 0 ---> 4*\n\n"
+        .fmt(mut buf)
     "  (4) ANTI-KINGMAKING FORFEIT: `settle_forfeit(mask, stake) -> [u256; 3]`\n".fmt(mut buf)
     "      Stallers forfeit stake; survivors split ceil/floor(STAKE/2) independently\n".fmt(mut buf)
-    "      of board positions (board `Positions` omitted from the type signature!).\n\n".fmt(mut buf)
+    "      of board positions (board `Positions` omitted from the type signature!).\n\n"
+        .fmt(mut buf)
     "------------------------------------------------------------------------------\n".fmt(mut buf)
     "  Parameters  : FINISH=".fmt(mut buf)
     push_dec(mut buf, FINISH as u256)
@@ -83,7 +94,8 @@ fn cmd_explain() uses (out: mut Stdout) {
     push_dec(mut buf, MOVE_WINDOW)
     "\n  DOMAIN_TAG  : ".fmt(mut buf)
     push_hex_u256(mut buf, DOMAIN_TAG)
-    "\n==============================================================================\n".fmt(mut buf)
+    "\n==============================================================================\n"
+        .fmt(mut buf)
     print_buffer(buf)
 }
 

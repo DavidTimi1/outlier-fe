@@ -87,15 +87,12 @@ fn render_final_board(_ buf: mut MemBuffer, _ st: GameState, _ payouts: [u256; 3
         _ => 0,
     }
 
-    "\n  +------+---------+---------+---------+---------+----------+--------------+----------+\n".fmt(
-        mut buf,
-    )
-    "  | SEAT |  [ 0 ]  |  [ 1 ]  |  [ 2 ]  |  [ 3 ]  | [4* WIN] | FINAL STATUS |  PAYOUT  |\n".fmt(
-        mut buf,
-    )
-    "  +------+---------+---------+---------+---------+----------+--------------+----------+\n".fmt(
-        mut buf,
-    )
+    "\n  +------+---------+---------+---------+---------+----------+--------------+----------+\n"
+        .fmt(mut buf)
+    "  | SEAT |  [ 0 ]  |  [ 1 ]  |  [ 2 ]  |  [ 3 ]  | [4* WIN] | FINAL STATUS |  PAYOUT  |\n"
+        .fmt(mut buf)
+    "  +------+---------+---------+---------+---------+----------+--------------+----------+\n"
+        .fmt(mut buf)
     var s: u8 = 0
     while s < 3 {
         let seat = Seat { raw: s }
@@ -175,9 +172,8 @@ fn render_final_board(_ buf: mut MemBuffer, _ st: GameState, _ payouts: [u256; 3
         " |\n".fmt(mut buf)
         s = s + 1
     }
-    "  +------+---------+---------+---------+---------+----------+--------------+----------+\n".fmt(
-        mut buf,
-    )
+    "  +------+---------+---------+---------+---------+----------+--------------+----------+\n"
+        .fmt(mut buf)
 }
 fn colour_name(_ c: u8) -> String<5> {
     if c == 0 {
@@ -289,7 +285,15 @@ pub fn play_and_log(
     _ trace_out: mut MemBuffer,
     _ log_out: mut MemBuffer,
 ) -> StepOut {
-    play_and_log_with_opts(seed, mode, stake, table, false, mut trace_out, mut log_out)
+    play_and_log_with_opts(
+        seed,
+        mode,
+        stake,
+        table,
+        false,
+        mut trace_out,
+        mut log_out,
+    )
 }
 
 pub fn play_and_log_with_opts(
@@ -585,9 +589,8 @@ pub fn play_and_log_with_opts(
                         push_dec(mut trace_out, winner.to_u256())
                         match mv {
                             Move::Advance => {
-                                " chooses ADVANCE (+1 ===> towards FINISH 4*)\n\n".fmt(
-                                    mut trace_out,
-                                )
+                                " chooses ADVANCE (+1 ===> towards FINISH 4*)\n\n"
+                                    .fmt(mut trace_out)
                             },
                             Move::Push { target } => {
                                 " chooses PUSH(S".fmt(mut trace_out)
