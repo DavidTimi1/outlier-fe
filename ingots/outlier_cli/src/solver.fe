@@ -9,7 +9,7 @@ use ingot::log_v1::play_and_log
 use outlier_core::{Colour, FINISH, Outcome, ROUND_CAP, Seat, leader, Positions, Position, resolve}
 use std::io::Display
 
-const SCALE: u256 = 1000000
+const SCALE: u256 = 1_000_000
 
 fn pos_idx(_ r: u8, _ p0: u8, _ p1: u8, _ p2: u8) -> usize {
     // r in 0..=20 (21), p0, p1, p2 in 0..=4 (5 each) -> 21 * 125 = 2625 entries

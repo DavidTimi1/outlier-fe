@@ -1,3 +1,4 @@
+#![cfg(target = "evm")]
 // Comprehensive EVM contract tests for `OutlierTable` (T3.3, T3.5).
 // Uses `PlayerProxy` to simulate 3 distinct player addresses + an outsider,
 // verifies exact 4-byte custom error selectors via `evm.try_call` + `is_error<E>`,

@@ -35,6 +35,26 @@ pub fn push_hex_u256(_ out: mut MemBuffer, _ val: u256) {
     }
 }
 
+/// Appends abbreviated 32-byte hex word `0xabcdef..123456` (first 6 and last 6 hex digits).
+pub fn push_hex_short(_ out: mut MemBuffer, _ val: u256) {
+    "0x".fmt(mut out)
+    var i: u256 = 64
+    while i > 58 {
+        i = i - 1
+        let shift = i * 4
+        let nib: u8 = ((val >> shift) & 0xF).downcast_truncate()
+        out.push(nibble_to_hex_byte(nib))
+    }
+    "..".fmt(mut out)
+    var j: u256 = 6
+    while j > 0 {
+        j = j - 1
+        let shift = j * 4
+        let nib: u8 = ((val >> shift) & 0xF).downcast_truncate()
+        out.push(nibble_to_hex_byte(nib))
+    }
+}
+
 /// Appends decimal representation of `val` using `Display`.
 pub fn push_dec(_ out: mut MemBuffer, _ val: u256) {
     val.fmt(mut out)

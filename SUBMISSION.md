@@ -4,16 +4,17 @@
 
 ---
 
-## 60-Second Tour
+## 60-second tour
+Three players secretly pick a colour; the odd one out wins the round and moves. The whole rule set is one pure Fe function (`outlier_core::step`), so the EVM contract and the native CLI verifier compile from the same source.
 
 ```sh
-fe build -i outlier_cli --backend native --emit executable --out-dir out   # build the native Fe CLI
-./scripts/run_demo.sh                                                      # play, replay, tamper-check, analyze
-diff <(./scripts/run_demo.sh) demo/transcript.txt && echo "transcript reproduces"
+fe build -i outlier_cli --backend native --emit executable --out-dir out
+./scripts/run_demo.sh                 # deterministic suite: play, replay, tamper-check, analyze
+./scripts/walkthrough.sh --auto 2.5   # human-speed visual round cards & live 3-lane race track
 ```
 
-What you will see: a full 3-player game is played and replayed (`VERIFIED 43 transitions`), a stalled player is forfeited and settled (`VERIFIED 16 transitions`), a corrupted log is rejected (`DIVERGENCE at step 8`), and the solver prints its strategy tables. The same `step` function also runs inside the EVM contract (`fe test -i outlier_table`).
-
+Start with [docs/PATTERN.md](./docs/PATTERN.md) (reusable pattern, 18-line sealed-bid auction)
+or [docs/FE_FINDINGS.md](./docs/FE_FINDINGS.md) (compiler findings, Fe vs Solidity).
 
 ---
 
@@ -155,13 +156,26 @@ python3 scripts/anvil_replay_e2e.py
 
 ## Demo
 
-Run the entire deterministic demo in one command (`make demo` or `./scripts/run_demo.sh`), which reproduces [demo/transcript.txt](./demo/transcript.txt) byte-for-byte:
+### 1. Deterministic Full-Suite Demo (Recommended for Judges)
+Run the entire deterministic demo in one non-interactive command (`make demo` or `./scripts/run_demo.sh`), which reproduces [demo/transcript.txt](./demo/transcript.txt) byte-for-byte:
 
 ```sh
 ./scripts/run_demo.sh
+diff <(./scripts/run_demo.sh) demo/transcript.txt && echo "transcript reproduces"
 ```
 
-What the demo executes using the native Fe binary `./out/outlier_cli`:
+### 2. Human-Speed Step-by-Step Visual Walkthrough (`--steps`)
+To watch a game unfold round by round—showing the 3 sealed 7-word Keccak-256 commitment lockboxes, the opened colour cards, the odd-one-out outlier resolution, the live 3-lane race track (`[0] .. [4* WIN]`), and the 16-word hash-chain digest at every transition:
+
+```sh
+./scripts/walkthrough.sh              # press [Enter] to step through each round
+./scripts/walkthrough.sh --auto 2.5   # auto-advance every 2.5s at human reading speed
+./scripts/walkthrough.sh --forfeit    # step through the anti-kingmaking reveal stall & poke
+./out/outlier_cli play --seed 1 --stake 1001 --steps --out demo/game1.log
+```
+*(Optional interactive mode: `./scripts/walkthrough.sh --play` lets you play Seat S0 against Bot S1 & Bot S2 and verifies your resulting `demo/human_game.log` through `./out/outlier_cli replay`.)*
+
+What `./scripts/run_demo.sh` executes using the native Fe binary `./out/outlier_cli`:
 1. **`./out/outlier_cli explain` & `./out/outlier_cli vectors`**: Prints protocol parameters and verifies embedded Foundry `cast` Keccak vectors (`COMMIT_VEC_0`, `COMMIT_VEC_1`, `DIGEST_JOIN_1`, `PARITY_BATCH_1_100`).
 2. **`./out/outlier_cli play --seed 1 --stake 1001 --out demo/game1.log` → `./out/outlier_cli replay demo/game1.log`**: Plays a 6-round, 43-transition game to completion and independently verifies its hash-chained digest (`VERIFIED 43 transitions, final digest 0x9930ed42...`).
 3. **`./out/outlier_cli play --seed 42 --stake 1001 --strategy forfeit --out demo/game2_forfeit.log` → `./out/outlier_cli replay demo/game2_forfeit.log`**: Demonstrates Seat 2 withholding their reveal on Round 2, triggering `POKE` after `REVEAL_WINDOW` and settling the odd stake `1001` into `(1502, 1501, 0)` (`VERIFIED 16 transitions`).
@@ -194,7 +208,7 @@ What the demo executes using the native Fe binary `./out/outlier_cli`:
 See [DECLARATION.md](./DECLARATION.md) for the complete declaration:
 - **Pre-existing work:** None prior to November 3, 2026 (started from `fe-lang/builders-challenge-starter`).
 - **Third-party code:** None (100% original Fe and Python test-oracle code written for this entry).
-- **AI assistance:** AI coding tools were used for specification refinement, Fe 26.6.0 stdlib spike discovery, implementation, mutation testing, and documentation; the human author reviewed, tested, and takes full responsibility for all code and claims.
+- **My role & AI assistance:** I chose the project direction, designed the three-player odd-one-out mechanism and anti-kingmaking invariants, completed the Fe starter guide to review the Fe implementation for structural/type correctness, and used my Python familiarity to treat the Python reference model (`oracle/outlier_model.py`) as my verification blueprint against the Fe code. I used AI tools (Claude and Google Antigravity) to accelerate drafting the specs/docs, writing the multi-ingot Fe implementation and Python model checker/scripts, and iterating on compiler/test loops.
 
 ---
 

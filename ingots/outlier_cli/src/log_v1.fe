@@ -19,6 +19,7 @@ use ingot::hex::{
     next_token_end,
     parse_u256_slice,
     push_dec,
+    push_hex_short,
     push_hex_u256,
     skip_spaces,
 }
@@ -45,6 +46,135 @@ use outlier_core::{
 use std::io::Display
 use testkit::SplitMix64
 
+fn render_live_track(_ buf: mut MemBuffer, _ st: GameState) {
+    "      LANE    START [0]    TILE [1]     TILE [2]     TILE [3]    FINISH [4*]\n".fmt(mut buf)
+    "            +-----------+-----------+-----------+-----------+-----------+\n".fmt(mut buf)
+    var s: u8 = 0
+    while s < 3 {
+        let seat = Seat { raw: s }
+        let pos = st.positions.get(seat).to_u8()
+        "       S".fmt(mut buf)
+        push_dec(mut buf, s as u256)
+        "   |".fmt(mut buf)
+        var col: u8 = 0
+        while col <= FINISH {
+            if pos == col {
+                if col == FINISH {
+                    "   <S".fmt(mut buf)
+                    push_dec(mut buf, s as u256)
+                    "*>   |".fmt(mut buf)
+                } else {
+                    "   [ S".fmt(mut buf)
+                    push_dec(mut buf, s as u256)
+                    " ]  |".fmt(mut buf)
+                }
+            } else {
+                "     .     |".fmt(mut buf)
+            }
+            col = col + 1
+        }
+        "\n            +-----------+-----------+-----------+-----------+-----------+\n".fmt(mut buf)
+        s = s + 1
+    }
+}
+
+fn render_final_board(_ buf: mut MemBuffer, _ st: GameState, _ payouts: [u256; 3]) {
+    let forf_mask: u8 = match st.phase {
+        Phase::Finished { result } => match result {
+            GameResult::Forfeited { mask } => mask,
+            _ => 0,
+        },
+        _ => 0,
+    }
+
+    "\n  +------+---------+---------+---------+---------+----------+--------------+----------+\n"
+        .fmt(mut buf)
+    "  | SEAT |  [ 0 ]  |  [ 1 ]  |  [ 2 ]  |  [ 3 ]  | [4* WIN] | FINAL STATUS |  PAYOUT  |\n"
+        .fmt(mut buf)
+    "  +------+---------+---------+---------+---------+----------+--------------+----------+\n"
+        .fmt(mut buf)
+    var s: u8 = 0
+    while s < 3 {
+        let seat = Seat { raw: s }
+        let pos = st.positions.get(seat).to_u8()
+        let bit: u8 = (1 as u8) << s
+        let is_forf = (forf_mask & bit) != 0
+
+        "  |  S".fmt(mut buf)
+        push_dec(mut buf, s as u256)
+        "  |".fmt(mut buf)
+
+        var col: u8 = 0
+        while col <= FINISH {
+            if pos == col {
+                if col == FINISH {
+                    "  <S".fmt(mut buf)
+                    push_dec(mut buf, s as u256)
+                    "*>   |".fmt(mut buf)
+                } else if is_forf {
+                    "  (S".fmt(mut buf)
+                    push_dec(mut buf, s as u256)
+                    "x)  |".fmt(mut buf)
+                } else {
+                    "  [S".fmt(mut buf)
+                    push_dec(mut buf, s as u256)
+                    "]   |".fmt(mut buf)
+                }
+            } else {
+                if col == FINISH {
+                    "    .     |".fmt(mut buf)
+                } else {
+                    "    .    |".fmt(mut buf)
+                }
+            }
+            col = col + 1
+        }
+
+        match st.phase {
+            Phase::Finished { result } => match result {
+                GameResult::Won { winner } => {
+                    if winner.raw == s {
+                        "  * WINNER *  | ".fmt(mut buf)
+                    } else {
+                        "  Active      | ".fmt(mut buf)
+                    }
+                },
+                GameResult::CapReached { .. } => {
+                    if payouts[s as usize] > 0 {
+                        "  = CAP-WIN = | ".fmt(mut buf)
+                    } else {
+                        "  Active      | ".fmt(mut buf)
+                    }
+                },
+                GameResult::Forfeited { .. } => {
+                    if is_forf {
+                        "  X FORFEIT X | ".fmt(mut buf)
+                    } else {
+                        "  + SURVIVOR+ | ".fmt(mut buf)
+                    }
+                },
+                GameResult::Cancelled { .. } => {
+                    "  - REFUND -  | ".fmt(mut buf)
+                },
+            },
+            _ => {
+                "  Active      | ".fmt(mut buf)
+            },
+        }
+
+        let pay = payouts[s as usize]
+        if pay == 0 {
+            "       0".fmt(mut buf)
+        } else {
+            "    ".fmt(mut buf)
+            push_dec(mut buf, pay)
+        }
+        " |\n".fmt(mut buf)
+        s = s + 1
+    }
+    "  +------+---------+---------+---------+---------+----------+--------------+----------+\n"
+        .fmt(mut buf)
+}
 fn colour_name(_ c: u8) -> String<5> {
     if c == 0 {
         "Red  "
@@ -152,6 +282,26 @@ pub fn play_and_log(
     _ mode: u8,
     _ stake: u256,
     _ table: u256,
+    _ trace_out: mut MemBuffer,
+    _ log_out: mut MemBuffer,
+) -> StepOut {
+    play_and_log_with_opts(
+        seed,
+        mode,
+        stake,
+        table,
+        false,
+        mut trace_out,
+        mut log_out,
+    )
+}
+
+pub fn play_and_log_with_opts(
+    _ seed: u256,
+    _ mode: u8,
+    _ stake: u256,
+    _ table: u256,
+    _ show_steps: bool,
     _ trace_out: mut MemBuffer,
     _ log_out: mut MemBuffer,
 ) -> StepOut {
@@ -273,6 +423,7 @@ pub fn play_and_log(
 
         // Commit phase
         now = now + 5
+        var comm_hashes: [u256; 3] = [0, 0, 0]
         var s_idx: u8 = 0
         while s_idx < 3 {
             let col = match Colour::from_u8(cols_raw[s_idx as usize]) {
@@ -287,6 +438,7 @@ pub fn play_and_log(
                 colour: col,
                 nonce: nonces[s_idx as usize],
             )
+            comm_hashes[s_idx as usize] = h
             let inp = Input::Commit { hash: h }
             let caller = players[s_idx as usize]
             match step(
@@ -307,6 +459,7 @@ pub fn play_and_log(
             }
             s_idx = s_idx + 1
         }
+        let post_commit_digest = cur_digest
 
         // Reveal phase (in mode == 1 on round 2, S2 withholds reveal after seeing S0 & S1!)
         let withhold_s2 = (mode == 1) && (rnd == 2)
@@ -339,10 +492,39 @@ pub fn play_and_log(
         }
 
         if withhold_s2 {
-            "[Round ".fmt(mut trace_out)
-            push_dec(mut trace_out, rnd as u256)
-            "] S0 & S1 revealed; S2 withholds reveal past deadline -> POKE triggers Forfeited(mask=4)!\n"
-                .fmt(mut trace_out)
+            if show_steps {
+                "\n==============================================================================\n"
+                    .fmt(mut trace_out)
+                "  ROUND ".fmt(mut trace_out)
+                push_dec(mut trace_out, rnd as u256)
+                "  //  COMMIT-REVEAL & DEADLINE ENFORCEMENT\n".fmt(mut trace_out)
+                "==============================================================================\n"
+                    .fmt(mut trace_out)
+                "  [1] SEALED KECCAK-256 COMMITMENTS (7-word lockboxes placed on table):\n"
+                    .fmt(mut trace_out)
+                "      S0: [LOCKED ".fmt(mut trace_out)
+                push_hex_short(mut trace_out, comm_hashes[0])
+                "]   S1: [LOCKED ".fmt(mut trace_out)
+                push_hex_short(mut trace_out, comm_hashes[1])
+                "]   S2: [LOCKED ".fmt(mut trace_out)
+                push_hex_short(mut trace_out, comm_hashes[2])
+                "]\n".fmt(mut trace_out)
+                "  [2] REVEAL PHASE (window = 600s):\n".fmt(mut trace_out)
+                "      S0 opens: [ ".fmt(mut trace_out)
+                colour_name(c0_raw).fmt(mut trace_out)
+                " ] (keccak match OK)\n      S1 opens: [ ".fmt(mut trace_out)
+                colour_name(c1_raw).fmt(mut trace_out)
+                " ] (keccak match OK)\n      S2 STALLS PAST DEADLINE (withholds reveal)!\n"
+                    .fmt(mut trace_out)
+                "  [3] PERMISSIONLESS POKE (now > deadline):\n".fmt(mut trace_out)
+                "      Triggers Forfeited(mask=4) -> settle_forfeit splits S2's stake!\n"
+                    .fmt(mut trace_out)
+            } else {
+                "[Round ".fmt(mut trace_out)
+                push_dec(mut trace_out, rnd as u256)
+                "] S0 & S1 revealed; S2 withholds reveal past deadline -> POKE triggers Forfeited(mask=4)!\n"
+                    .fmt(mut trace_out)
+            }
             now = now + REVEAL_WINDOW + 5
             match step(
                 st,
@@ -364,63 +546,164 @@ pub fn play_and_log(
             // Update S1 frequency count after reveal
             s1_counts[c1_raw as usize] = s1_counts[c1_raw as usize] + 1
 
-            "[Round ".fmt(mut trace_out)
-            push_dec(mut trace_out, rnd as u256)
-            "] Reveals: S0=".fmt(mut trace_out)
-            colour_name(c0_raw).fmt(mut trace_out)
-            " S1=".fmt(mut trace_out)
-            colour_name(c1_raw).fmt(mut trace_out)
-            " S2=".fmt(mut trace_out)
-            colour_name(c2_raw).fmt(mut trace_out)
+            if show_steps {
+                "\n==============================================================================\n"
+                    .fmt(mut trace_out)
+                "  ROUND ".fmt(mut trace_out)
+                push_dec(mut trace_out, rnd as u256)
+                "  //  STEP-BY-STEP PROTOCOL TRANSITION\n".fmt(mut trace_out)
+                "==============================================================================\n"
+                    .fmt(mut trace_out)
+                "  [1] SEALED KECCAK-256 COMMITMENTS (face-down envelopes locked on-chain):\n"
+                    .fmt(mut trace_out)
+                "      S0: [SEALED ".fmt(mut trace_out)
+                push_hex_short(mut trace_out, comm_hashes[0])
+                "]   S1: [SEALED ".fmt(mut trace_out)
+                push_hex_short(mut trace_out, comm_hashes[1])
+                "]   S2: [SEALED ".fmt(mut trace_out)
+                push_hex_short(mut trace_out, comm_hashes[2])
+                "]\n      Commit Phase Chain Digest: ".fmt(mut trace_out)
+                push_hex_short(mut trace_out, post_commit_digest)
+                "\n\n  [2] ENVELOPES OPENED (keccak256(colour, nonce) verified against commit):\n"
+                    .fmt(mut trace_out)
+                "      +------------------+     +------------------+     +------------------+\n"
+                    .fmt(mut trace_out)
+                "      | S0:  ".fmt(mut trace_out)
+                colour_name(c0_raw).fmt(mut trace_out)
+                "       |     | S1:  ".fmt(mut trace_out)
+                colour_name(c1_raw).fmt(mut trace_out)
+                "       |     | S2:  ".fmt(mut trace_out)
+                colour_name(c2_raw).fmt(mut trace_out)
+                "       |\n".fmt(mut trace_out)
+                "      +------------------+     +------------------+     +------------------+\n"
+                    .fmt(mut trace_out)
 
-            match st.phase {
-                Phase::WinnerMove { winner, .. } => {
-                    " -> Winner=S".fmt(mut trace_out)
-                    push_dec(mut trace_out, winner.to_u256())
-                    let mv = smart_move(st, winner)
-                    match mv {
-                        Move::Advance => " Move=ADV".fmt(mut trace_out),
-                        Move::Push { target } => {
-                            " Move=PUSH(S".fmt(mut trace_out)
-                            push_dec(mut trace_out, target.to_u256())
-                            ")".fmt(mut trace_out)
-                        },
-                    }
-                    now = now + 5
-                    let inp = Input::MoveInput { mv }
-                    let caller = players[winner.index()]
-                    match step(
-                        st,
-                        cur_digest,
-                        inp,
-                        StepCtx { now, caller, table, stake_paid: 0 },
-                    ) {
-                        Result::Ok(o) => {
-                            st = o.state
-                            cur_digest = o.digest
-                            last_out = o
-                            write_log_step(mut log_out, st.step_no, now, caller, inp, cur_digest)
-                        },
-                        Result::Err(_) => {
-                            return last_out
-                        },
-                    }
-                },
-                _ => {
-                    " -> NoWinner".fmt(mut trace_out)
-                },
+                match st.phase {
+                    Phase::WinnerMove { winner, .. } => {
+                        "      >>> ODD-ONE-OUT: Seat S".fmt(mut trace_out)
+                        push_dec(mut trace_out, winner.to_u256())
+                        " is the OUTLIER! <<<\n\n  [3] WINNER MOVE & LIVE 3-LANE RACE TRACK:\n"
+                            .fmt(mut trace_out)
+                        let mv = smart_move(st, winner)
+                        "      Action: Seat S".fmt(mut trace_out)
+                        push_dec(mut trace_out, winner.to_u256())
+                        match mv {
+                            Move::Advance => {
+                                " chooses ADVANCE (+1 ===> towards FINISH 4*)\n\n"
+                                    .fmt(mut trace_out)
+                            },
+                            Move::Push { target } => {
+                                " chooses PUSH(S".fmt(mut trace_out)
+                                push_dec(mut trace_out, target.to_u256())
+                                ") (-1 <=== defensive block!)\n\n".fmt(mut trace_out)
+                            },
+                        }
+                        now = now + 5
+                        let inp = Input::MoveInput { mv }
+                        let caller = players[winner.index()]
+                        match step(
+                            st,
+                            cur_digest,
+                            inp,
+                            StepCtx { now, caller, table, stake_paid: 0 },
+                        ) {
+                            Result::Ok(o) => {
+                                st = o.state
+                                cur_digest = o.digest
+                                last_out = o
+                                write_log_step(
+                                    mut log_out,
+                                    st.step_no,
+                                    now,
+                                    caller,
+                                    inp,
+                                    cur_digest,
+                                )
+                            },
+                            Result::Err(_) => {
+                                return last_out
+                            },
+                        }
+                    },
+                    _ => {
+                        "      >>> NO WINNER (all 3 distinct or all 3 equal — nobody moves) <<<\n\n  [3] LIVE 3-LANE RACE TRACK:\n\n"
+                            .fmt(mut trace_out)
+                    },
+                }
+
+                render_live_track(mut trace_out, st)
+                "      Step #".fmt(mut trace_out)
+                push_dec(mut trace_out, st.step_no)
+                " Hash-Chain Digest: ".fmt(mut trace_out)
+                push_hex_u256(mut trace_out, cur_digest)
+                "\n".fmt(mut trace_out)
+            } else {
+                "[Round ".fmt(mut trace_out)
+                push_dec(mut trace_out, rnd as u256)
+                "] Reveals: S0=".fmt(mut trace_out)
+                colour_name(c0_raw).fmt(mut trace_out)
+                " S1=".fmt(mut trace_out)
+                colour_name(c1_raw).fmt(mut trace_out)
+                " S2=".fmt(mut trace_out)
+                colour_name(c2_raw).fmt(mut trace_out)
+
+                match st.phase {
+                    Phase::WinnerMove { winner, .. } => {
+                        " -> Winner=S".fmt(mut trace_out)
+                        push_dec(mut trace_out, winner.to_u256())
+                        let mv = smart_move(st, winner)
+                        match mv {
+                            Move::Advance => " Move=ADV".fmt(mut trace_out),
+                            Move::Push { target } => {
+                                " Move=PUSH(S".fmt(mut trace_out)
+                                push_dec(mut trace_out, target.to_u256())
+                                ")".fmt(mut trace_out)
+                            },
+                        }
+                        now = now + 5
+                        let inp = Input::MoveInput { mv }
+                        let caller = players[winner.index()]
+                        match step(
+                            st,
+                            cur_digest,
+                            inp,
+                            StepCtx { now, caller, table, stake_paid: 0 },
+                        ) {
+                            Result::Ok(o) => {
+                                st = o.state
+                                cur_digest = o.digest
+                                last_out = o
+                                write_log_step(
+                                    mut log_out,
+                                    st.step_no,
+                                    now,
+                                    caller,
+                                    inp,
+                                    cur_digest,
+                                )
+                            },
+                            Result::Err(_) => {
+                                return last_out
+                            },
+                        }
+                    },
+                    _ => {
+                        " -> NoWinner".fmt(mut trace_out)
+                    },
+                }
+
+                " | Track=(".fmt(mut trace_out)
+                push_dec(mut trace_out, st.positions.p0.to_u256())
+                ",".fmt(mut trace_out)
+                push_dec(mut trace_out, st.positions.p1.to_u256())
+                ",".fmt(mut trace_out)
+                push_dec(mut trace_out, st.positions.p2.to_u256())
+                ")\n".fmt(mut trace_out)
             }
-
-            " | Track=(".fmt(mut trace_out)
-            push_dec(mut trace_out, st.positions.p0.to_u256())
-            ",".fmt(mut trace_out)
-            push_dec(mut trace_out, st.positions.p1.to_u256())
-            ",".fmt(mut trace_out)
-            push_dec(mut trace_out, st.positions.p2.to_u256())
-            ")\n".fmt(mut trace_out)
         }
     }
 
+    render_final_board(mut trace_out, st, last_out.payouts)
     "[Finished] steps=".fmt(mut trace_out)
     push_dec(mut trace_out, st.step_no)
     " payouts=(".fmt(mut trace_out)
