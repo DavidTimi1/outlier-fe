@@ -3,13 +3,36 @@ OUTLIER — Reproducible Native Fe CLI Demo Transcript
 ========================================================================
 
 $ ./out/outlier_cli explain
-OUTLIER Protocol Specification v1.0 (Pure Fe State Machine)
-  Rule        : 3 players commit-reveal {Red=0, Blue=1, Green=2}. If exactly two match,
-                the odd one out (the outlier) wins the round and chooses:
-                Move::Advance (+1 up to FINISH) or Move::Push(target) (-PUSH down to 0).
-  Parameters  : FINISH=4 PUSH=1 ROUND_CAP=20
-  Windows (s) : JOIN=3600 COMMIT=600 REVEAL=600 MOVE=600
+==============================================================================
+    ___    _   _   _____   _       ___   _____   ____  
+   / _ \  | | | | |_   _| | |     |_ _| | ____| |  _ \ 
+  | | | | | | | |   | |   | |      | |  |  _|   | |_) |
+  | |_| | | |_| |   | |   | |___   | |  | |___  |  _ < 
+   \___/   \___/    |_|   |_____| |___| |_____| |_| \_\
+
+   THREE-PLAYER HIDDEN-MOVE PROTOCOL  //  ONE PURE FE STATE MACHINE
+   Same `outlier_core::step` compiles to:  [EVM Contract]  +  [Native CLI]
+==============================================================================
+
+  (1) SEALED KECCAK COMMIT         (2) ODD-ONE-OUT REVEAL          (3) WINNER MOVE
+  +------------------------+       +-------------------------+     +---------------+
+  | S0: [SEALED 0x2e..98]  |       | S0: [ RED   ] --+       |     |   +1 ===>     |
+  |                        |       |                 +- MATCH|     |   ADVANCE     |
+  | S1: [SEALED 0x8a..c2]  | ====> | S1: [ RED   ] --+       |     |      or       |
+  |                        |       |                         |     |   -1 <===     |
+  | S2: [SEALED 0x1b..a3]  |       | S2: < BLUE  > * OUTLIER!| ==> |   PUSH(opp)   |
+  +------------------------+       +-------------------------+     +---------------+
+   7-word Keccak-256 lockbox        keccak(colour,nonce) check      Race 0 ---> 4*
+
+  (4) ANTI-KINGMAKING FORFEIT: `settle_forfeit(mask, stake) -> [u256; 3]`
+      Stallers forfeit stake; survivors split ceil/floor(STAKE/2) independently
+      of board positions (board `Positions` omitted from the type signature!).
+
+------------------------------------------------------------------------------
+  Parameters  : FINISH=4  |  PUSH=1  |  ROUND_CAP=20
+  Windows (s) : JOIN=3600 |  COMMIT=600 |  REVEAL=600 |  MOVE=600
   DOMAIN_TAG  : 0x350026eb9d43d1ca67d039dd30760600db6ca312c02ce29ba9e06e098de9e370
+==============================================================================
 
 $ ./out/outlier_cli vectors
 === OUTLIER Foundry `cast` Cryptographic Vector Self-Check ===
@@ -28,6 +51,14 @@ $ ./out/outlier_cli play --seed 1 --stake 1001 --out demo/game1.log
 [Round 4] Reveals: S0=Red   S1=Red   S2=Green -> Winner=S2 Move=ADV | Track=(0,0,3)
 [Round 5] Reveals: S0=Red   S1=Green S2=Blue  -> NoWinner | Track=(0,0,3)
 [Round 6] Reveals: S0=Green S1=Green S2=Red   -> Winner=S2 Move=ADV | Track=(0,0,4)
+
+  +------+---------+---------+---------+---------+----------+--------------+----------+
+  | SEAT |  [ 0 ]  |  [ 1 ]  |  [ 2 ]  |  [ 3 ]  | [4* WIN] | FINAL STATUS |  PAYOUT  |
+  +------+---------+---------+---------+---------+----------+--------------+----------+
+  |  S0  |  [S0]   |    .    |    .    |    .    |    .     |  Active      |        0 |
+  |  S1  |  [S1]   |    .    |    .    |    .    |    .     |  Active      |        0 |
+  |  S2  |    .    |    .    |    .    |    .    |  <S2*>   |  * WINNER *  |     3003 |
+  +------+---------+---------+---------+---------+----------+--------------+----------+
 [Finished] steps=43 payouts=(0, 0, 3003) final_digest=0x9930ed42eb6c4135117c777fc5374333eb3ab25b24b5b5a5d81bbea3c2429a57
 
 $ ./out/outlier_cli replay demo/game1.log
@@ -38,6 +69,14 @@ $ ./out/outlier_cli play --seed 42 --stake 1001 --strategy forfeit --out demo/ga
 [Registration] Seats S0(0x1001), S1(0x1002), S2(0x1003) joined. Digest=0xd2e599e9f961a9e93eb076cd3b6c9961e66904c25aab4b95668266d006750bb9
 [Round 1] Reveals: S0=Red   S1=Blue  S2=Red   -> Winner=S1 Move=ADV | Track=(0,1,0)
 [Round 2] S0 & S1 revealed; S2 withholds reveal past deadline -> POKE triggers Forfeited(mask=4)!
+
+  +------+---------+---------+---------+---------+----------+--------------+----------+
+  | SEAT |  [ 0 ]  |  [ 1 ]  |  [ 2 ]  |  [ 3 ]  | [4* WIN] | FINAL STATUS |  PAYOUT  |
+  +------+---------+---------+---------+---------+----------+--------------+----------+
+  |  S0  |  [S0]   |    .    |    .    |    .    |    .     |  + SURVIVOR+ |     1502 |
+  |  S1  |    .    |  [S1]   |    .    |    .    |    .     |  + SURVIVOR+ |     1501 |
+  |  S2  |  (S2x)  |    .    |    .    |    .    |    .     |  X FORFEIT X |        0 |
+  +------+---------+---------+---------+---------+----------+--------------+----------+
 [Finished] steps=16 payouts=(1502, 1501, 0) final_digest=0x1959d2dcc84d822f3f2a4ffbcffdbcc940dbc2641499b996ea675232fe879af0
 
 $ ./out/outlier_cli replay demo/game2_forfeit.log
